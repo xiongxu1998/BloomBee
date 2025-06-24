@@ -318,6 +318,19 @@ class InferenceSession:
         step_id = str(uuid.uuid4()) #生成一个唯一的步骤 ID。
 
         n_input_tokens = inputs.shape[1]
+        print(f"=== Step Debug Info ===")
+        print(f"step_id: {step_id}")
+        print(f"self._position: {self._position}")
+        print(f"n_input_tokens: {n_input_tokens}")
+        print(f"self._max_length: {self._max_length}")
+        print(f"self._position + n_input_tokens: {self._position + n_input_tokens}")
+        print(f"Will exceed limit? {self._position + n_input_tokens > self._max_length}")
+        print(f"inputs.shape: {inputs.shape}")
+        if hasattr(self, 'history') and self.history is not None:
+            print(f"self.history.shape: {self.history.shape}")
+        else:
+            print(f"self.history: None")
+        print(f"=======================")
         if self._position + n_input_tokens > self._max_length:
             raise ValueError(
                 f"Maximum length exceeded: prefix {self._position} + current {n_input_tokens} exceeds pre-allocated maximum {self._max_length}"

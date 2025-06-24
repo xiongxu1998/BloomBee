@@ -3,6 +3,7 @@ from typing import Optional
 import hivemind
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from hivemind.utils.logging import get_logger
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.llama import LlamaForCausalLM, LlamaForSequenceClassification, LlamaModel, LlamaPreTrainedModel

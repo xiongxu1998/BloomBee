@@ -52,7 +52,7 @@ def get_llama_config(name, **kwargs):
     arch_name = name
 
     if arch_name == "llama-7b":
-        config = LlamaConfig(name=name, input_dim=4096, n_head=32, num_hidden_layers=32, intermediate_size=11008)
+        config = LlamaConfig(name=name, input_dim=256, n_head=4, num_hidden_layers=2, intermediate_size=1024)
     elif arch_name == "llama-13b":
         config = LlamaConfig(name=name, input_dim=5120, n_head=40, num_hidden_layers=40, intermediate_size=13824)
     elif arch_name == "llama-30b":

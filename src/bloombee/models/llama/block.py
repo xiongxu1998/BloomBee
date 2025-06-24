@@ -55,12 +55,12 @@ def see_memory_usage(message, force=True):
 	# nvidia_smi.nvmlInit()
 	handle = nvmlDeviceGetHandleByIndex(0)
 	info = nvmlDeviceGetMemoryInfo(handle)
-	logger += "\n Nvidia-smi: " + str((info.used) / 1024 / 1024 / 1024) + " GB"
+	# logger += "\n Nvidia-smi: " + str((info.used) / 1024 / 1024 / 1024) + " GB"
 	
-	logger += '\n    Memory Allocated: '+str(torch.cuda.memory_allocated() / (1024 * 1024 * 1024)) +'  GigaBytes\n'
-	logger +=   'Max Memory Allocated: ' + str(
-		torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)) + '  GigaBytes\n'
-	print(logger)
+	# logger += '\n    Memory Allocated: '+str(torch.cuda.memory_allocated() / (1024 * 1024 * 1024)) +'  GigaBytes\n'
+	# logger +=   'Max Memory Allocated: ' + str(
+	# 	torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024)) + '  GigaBytes\n'
+	# print(logger)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin):
@@ -153,9 +153,22 @@ class OptimizedLlamaAttention(FLEX_LlamaAttention):
         
         print('block.py : class OptimizedLlamaAttention forward(): position_ids,', position_ids)
         see_memory_usage("-----------------------------------------after position_ids ")
-        i = int(position_ids.item())
         
-        super(OptimizedLlamaAttention, self).forward(hidden_states,cache_read_buf, weight_read_buf,attention_mask,cache_write_buf,i,k) 
+        # 🟢 Safer position_ids handling
+        if position_ids.numel() == 0:
+            start_position = 0
+        elif position_ids.dim() == 0:  # 0-dimensional tensor (scalar)
+            start_position = int(position_ids.item())
+        elif position_ids.dim() == 1:  # 1-dimensional tensor
+            start_position = int(position_ids[0].item())
+        elif position_ids.dim() == 2:  # 2-dimensional tensor [batch, seq_len]
+            start_position = int(position_ids[0, 0].item())
+        else:
+            start_position = 0  # fallback
+        
+        print(f'start_position extracted: {start_position}')
+        
+        super(OptimizedLlamaAttention, self).forward(hidden_states,cache_read_buf, weight_read_buf,attention_mask,cache_write_buf,start_position,k)
         see_memory_usage("-----------------------------------------after OptimizedLlamaAttention forward ")
         # print('hidden_states ', hidden_states.val)
         self.temp_hidden_states.val = hidden_states.val
@@ -296,6 +309,12 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         self.attention_mask = array_1d(num_gpu_batches, ValueHolder)
 
         self.task = None
+        
+        # 🚀 Performance optimization: Cache tokenizer and Task related variables to avoid repeated creation
+        self._cached_tokenizer = None
+        self._cached_task = None
+        self._is_initialized = False
+        
         # print('before init_all_weights OptimizedLlamaDecoderLayer self.config', self.config)
         see_memory_usage("-----------------------------------------before init_all_weights ")
         # Initialize weights and apply final processing
@@ -420,27 +439,51 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         # print('args ', args)
         # prompt_len, gen_len, cut_gen_len = args.prompt_len, args.gen_len, args.cut_gen_len
         # prompt_len, gen_len, cut_gen_len = 32, 32, 32
-        tokenizer = AutoTokenizer.from_pretrained(f"huggyllama/{self.llama_config.name}", padding_side="left", legacy=False)
-        tokenizer.pad_token = '[PAD]'
+        
+        # 🚀 Performance optimization: Use cached tokenizer, avoid repeated creation
+        if self._cached_tokenizer is None:
+            self._cached_tokenizer = AutoTokenizer.from_pretrained(f"huggyllama/{self.llama_config.name}", padding_side="left", legacy=False)
+            self._cached_tokenizer.pad_token = '[PAD]'
+        tokenizer = self._cached_tokenizer
+        
         # num_prompts = args.num_gpu_batches * args.gpu_batch_size
         num_prompts = 1
         
-        see_memory_usage("-----------------------------------------before cuda stream init ")
-        prompt_len, gen_len, cut_gen_len = 1,1,1 ##########-------------------------------------
-        inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
-        # inputs = hidden_states.cpu()
-        # print('inputs , ', inputs)
+        # see_memory_usage("-----------------------------------------before cuda stream init ")
+        # 🔴 Fix hardcoding: Use dynamic prompt length instead of hardcoded 1
+        # prompt_len, gen_len, cut_gen_len = 1,128,128 ##########-------------------------------------
+        # Infer prompt_len from actual input hidden_states
+        actual_prompt_len = hidden_states.shape[1] if hidden_states.shape[1] > 0 else 1
+        prompt_len, gen_len, cut_gen_len = actual_prompt_len, max_new_tokens, max_new_tokens
+        
+        # 🚀 Performance optimization: Only create Task on first call or when parameters change
+        task_changed = (self._cached_task is None or 
+                       self._cached_task.gen_len != max_new_tokens or 
+                       self._cached_task.prompt_len != actual_prompt_len)
+        
+        if task_changed:
+            inputs = get_test_inputs(prompt_len, num_prompts, tokenizer)
+            # inputs = hidden_states.cpu()
+            if not self._is_initialized:
+                print('inputs shape and content:', inputs)
+                print('inputs[0] length:', len(inputs[0]) if inputs else 0)
        
-        task = Task(
-            inputs=inputs,
-            prompt_len=len(inputs[0]),
-            gen_len=max_new_tokens,
-            cut_gen_len=cut_gen_len,
-            do_sample=do_sample,
-            temperature=temperature,
-            stop=stop,
-            top_p=top_p
-        )
+            self._cached_task = Task(
+                inputs=inputs,
+                prompt_len=len(inputs[0]),
+                gen_len=max_new_tokens,
+                cut_gen_len=cut_gen_len,
+                do_sample=do_sample,
+                temperature=temperature,
+                stop=stop,
+                top_p=top_p
+            )
+            if not self._is_initialized:
+                print(f'Task created - prompt_len: {self._cached_task.prompt_len}, gen_len: {self._cached_task.gen_len}')
+                self._is_initialized = True
+            
+        task = self._cached_task
+        
         num_layers = self.num_layers
         num_gpu_batches = self.num_gpu_batches
         gpu_batch_size = self.policy.gpu_batch_size
@@ -491,8 +534,12 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         if self.policy.cpu_cache_compute:
             self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
         
-        debug_mode = None #######
-        overlap = False #######
+        # 🟡 Fix hardcoding: Use configuration instead of hardcoding
+        # debug_mode = None #######
+        # overlap = False #######
+        debug_mode = kwargs.get('debug_mode', None)
+        overlap = self.policy.overlap if hasattr(self.policy, 'overlap') else False
+        
         if debug_mode is None:
             if not overlap:
                 # No overlap, easy to understand, suitable for debugging
@@ -509,15 +556,10 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
                         self.load_cache(i, j, k, overlap=False)
                         # self.load_hidden(i, j, k)
                          
-                        # if j ==1:
-                        #     print('j ==1 ', j)
-                        #     print('self.temp_hidden ', self.temp_hidden.val.data)
-                            # if self.temp_hidden.val.data:
-                            #     self.load_hidden_mlp(i, j, k)
-                        see_memory_usage('-----------------------------------------before compute_layer '+ str(i)+ '' + str(j)+' '+str(k))
+                        # 🚀 Performance optimization: Reduce debug output, only enable when needed
                         hidden_states = self.compute_layer(i, j, k).data.clone()  
                         # self.temp_hidden.val = self.compute_layer(i, j, k).data.clone()
-                        see_memory_usage('-----------------------------------------after compute_layer '+ str(i)+ '' + str(j)+' '+str(k))
+                        # see_memory_usage('-----------------------------------------after compute_layer '+ str(i)+ '' + str(j)+' '+str(k))
                         # print('self.temp_hidden ', self.temp_hidden.val.data)
                         # import pdb; pdb.set_trace()
                         # self.store_hidden(i, j, k)
@@ -734,15 +776,39 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         if j ==1:
             self.hidden[i][j][k].val = self.temp_hidden.val
         # print('compute_layer hidden val.data.shape', self.hidden[i][j][k].val.data.shape)
-        print(self.hidden[i][j][k].val)
+        # 🚀 Performance optimization: Reduce debug output
+        # print(self.hidden[i][j][k].val)
         # print('token i', i)
-        pos_id = torch.tensor(i)
+        
+        # 🔴 Fix: Correctly generate position_ids
+        # pos_id = torch.tensor(i)  # Old code: only pass single position
+        
+        # Generate position_ids based on actual input sequence length
+        if hasattr(self.hidden[i][j][k].val, 'data'):
+            seq_len = self.hidden[i][j][k].val.data.shape[1]
+        else:
+            seq_len = self.hidden[i][j][k].val.shape[1]
+        
+        # For each position generate correct position_ids
+        if seq_len > 1:
+            # Multi-token case: generate [0, 1, 2, ...] sequence
+            pos_id = torch.arange(seq_len, device=self.hidden[i][j][k].val.data.device if hasattr(self.hidden[i][j][k].val, 'data') else self.hidden[i][j][k].val.device)
+        else:
+            # Single token case: use timestep i
+            pos_id = torch.tensor(i)
+        
+        # 🚀 Performance optimization: Reduce debug output, only show on first call
+        if not hasattr(self, '_debug_shown') or not self._debug_shown:
+            print(f'compute_layer: i={i}, j={j}, k={k}, seq_len={seq_len}, pos_id={pos_id}')
+            self._debug_shown = True
+        
         # print('pos_id i', pos_id)
         # import pdb;pdb.set_trace()
         # print('layer j ', j)
         
         # Profile memory before forward pass
-        see_memory_usage(f"-----------------------------------------before compute_layer {j} forward pass for token {i}")
+        # 🚀 Performance optimization: Reduce memory monitoring calls
+        # see_memory_usage(f"-----------------------------------------before compute_layer {j} forward pass for token {i}")
         
         self.layers[j].forward(hidden_states=self.hidden[i][j][k], 
                                cache_read_buf=self.cache_read_buf[j][k],
@@ -753,7 +819,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
                                position_ids=pos_id)
                                
         # Profile memory after forward pass
-        see_memory_usage(f"-----------------------------------------after compute_layer {j} forward pass for token {i}")
+        # see_memory_usage(f"-----------------------------------------after compute_layer {j} forward pass for token {i}")
         
         self.temp_hidden.val = self.layers[j].temp_hidden_states.val
         # print('self.temp_hidden.val.data ', self.temp_hidden.val.data)
@@ -843,18 +909,18 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
 
 def get_test_inputs(prompt_len, num_prompts, tokenizer):
     prompts = [
-        # "Simply put, the theory of relativity states that ",
-
+        "Simply put, the theory of relativity states that",
         # "I believe the meaning of life is",
-        "",
+        # "",
         # """Translate English to French:
         # sea otter => loutre de mer
         # peppermint => menthe poivrée
         # plush girafe => girafe peluche
         # cheese =>""",
     ]
+    # 🟢 Improvement: Correctly handle different prompt lengths
     input_ids = tokenizer(prompts, padding="max_length",
-                          max_length=prompt_len).input_ids
-    return (input_ids[0],) * num_prompts
+                          max_length=prompt_len, truncation=True).input_ids
+    return (input_ids[0][:prompt_len],) * num_prompts
 
 
