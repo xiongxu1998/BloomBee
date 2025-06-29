@@ -407,7 +407,9 @@ class FLEX_LlamaAttention(LlamaAttention):
         self.task = task
 
     def init_weight(self, weight_home, path):
-        h, dtype = (self.config.hidden_size, np.float16)
+        h = self.config.hidden_size
+        dtype = self.llama_config.dtype
+        
         path = os.path.join(os.path.join(path, f"layers.{self.layer_id}."))
         weight_specs = [
             # 5 weight files
@@ -422,7 +424,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             # input layer norm
             ((h, ), dtype, path + "input_layernorm.weight"),
             # rotary_embed
-            ((64, ), dtype, path + "self_attn.rotary_emb.inv_freq"),
+            ((h // self.config.num_attention_heads // 2, ), dtype, path + "self_attn.rotary_emb.inv_freq"),
         ]
         see_memory_usage("-----------------------------------------before init weights of LLamaAttention ")
         weights = init_weight_list(weight_specs, self.policy, self.env)
@@ -627,7 +629,9 @@ class FLEX_LlamaMLP(LlamaMLP):
         self.task = task
 
     def init_weight(self, weight_home, path):
-        intermediate_size, h, dtype = (self.config.intermediate_size, self.config.hidden_size, np.float16)
+        dtype = self.llama_config.dtype
+
+        intermediate_size, h = (self.config.intermediate_size, self.config.hidden_size)
         print('intermediate_size, h, dtype ', intermediate_size, h, dtype)
         path = os.path.join(os.path.join(path, f"layers.{self.layer_id}."))
         weight_specs = [

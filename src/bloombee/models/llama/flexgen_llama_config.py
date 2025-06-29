@@ -60,6 +60,8 @@ def get_llama_config(name, **kwargs):
         config = LlamaConfig(name=name, hidden_size=8192, num_attention_heads=64, num_hidden_layers=80, intermediate_size=22016)
     elif arch_name == "llama-70b":
         config = LlamaConfig(name=name, hidden_size=8192, num_attention_heads=64, num_hidden_layers=80, intermediate_size=28672)
+    elif arch_name == "llama-68m":
+        config = LlamaConfig(name=name, hidden_size=768, num_attention_heads=12, num_hidden_layers=2, intermediate_size=3072)
     else:
         raise ValueError(f"Invalid model name: {name}")
     
@@ -76,8 +78,11 @@ def download_llama_weights_old(model_name, path):
     path = os.path.join(path, f"{model_name}-np")
     path = os.path.abspath(os.path.expanduser(path))
 
+    if "68m" in model_name:
+        hf_model_name = "JackFram/llama-68m"
+        model_class = LlamaForCausalLM
     if "llama" in model_name:
-        hf_model_name = "huggyllama/" + model_name
+        hf_model_name = model_name if "/" in model_name else "huggyllama/" + model_name
         model_class = LlamaForCausalLM
     else:
         raise ValueError("Invalid model name: {model_name}")
@@ -148,7 +153,9 @@ def download_llama_weights(model_name, path):
           f"The downloading and cpu loading can take dozens of minutes. "
           f"If it seems to get stuck, you can monitor the progress by "
           f"checking the memory usage of this process.")
-    if "llama" in model_name:
+    if "68m" in model_name:
+        hf_model_name = "JackFram/llama-68m"
+    elif "llama" in model_name:
         hf_model_name = "huggyllama/" + model_name
 
     folder = snapshot_download(hf_model_name, allow_patterns="*.bin")

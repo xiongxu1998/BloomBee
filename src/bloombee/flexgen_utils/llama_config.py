@@ -59,6 +59,9 @@ def get_llama_config(name, **kwargs):
         config = LlamaConfig(name=name, input_dim=6656, n_head=52, num_hidden_layers=60, intermediate_size=17920)
     elif arch_name == "llama-65b":
         config = LlamaConfig(name=name, input_dim=8192, n_head=64, num_hidden_layers=80, intermediate_size=22016)
+    elif arch_name == "llama-68m":
+        config = LlamaConfig(name=name, input_dim=768, n_head=12, num_hidden_layers=2, intermediate_size=3072, 
+                             dtype=np.float32)
     else:
         raise ValueError(f"Invalid model name: {name}")
     
@@ -75,8 +78,11 @@ def download_llama_weights_old(model_name, path):
     path = os.path.join(path, f"{model_name}-np")
     path = os.path.abspath(os.path.expanduser(path))
 
-    if "llama" in model_name:
-        hf_model_name = "huggyllama/" + model_name
+    if "68m" in model_name:
+        hf_model_name = "JackFram/llama-68m"
+        model_class = LlamaForCausalLM
+    elif "llama" in model_name:
+        hf_model_name = model_name if "/" in model_name else "huggyllama/" + model_name
         model_class = LlamaForCausalLM
     else:
         raise ValueError("Invalid model name: {model_name}")
@@ -147,9 +153,13 @@ def download_llama_weights(model_name, path):
           f"The downloading and cpu loading can take dozens of minutes. "
           f"If it seems to get stuck, you can monitor the progress by "
           f"checking the memory usage of this process.")
-    if "llama" in model_name:
-        hf_model_name = "huggyllama/" + model_name
+    if model_name == "llama-68m":
+        hf_model_name = "JackFram/llama-68m"
+    elif "llama" in model_name:
+        hf_model_name = model_name if "/" in model_name else "huggyllama/" + model_name
 
+    print("hf_model_name: ", hf_model_name)
+    print("model_name", model_name)
     folder = snapshot_download(hf_model_name, allow_patterns="*.bin")
     bin_files = glob.glob(os.path.join(folder, "*.bin"))
 
@@ -160,7 +170,9 @@ def download_llama_weights(model_name, path):
     os.makedirs(path, exist_ok=True)
 
     for bin_file in tqdm(bin_files, desc="Convert format"):
-        state = torch.load(bin_file)
+        state = torch.load(bin_file, weights_only=False)
+        if isinstance(state, dict) and 'state_dict' in state:
+            state = state['state_dict']
         for name, param in tqdm(state.items(), leave=False):
             name = name.replace("model.", "")
             name = name.replace("final_layer_norm", "layer_norm")
