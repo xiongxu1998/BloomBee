@@ -442,13 +442,16 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         
         # 🚀 Performance optimization: Use cached tokenizer, avoid repeated creation
         if self._cached_tokenizer is None:
-            if "68m" in self.llama_config.name:
-                self._cached_tokenizer = AutoTokenizer.from_pretrained(
-                    "JackFram/llama-68m", padding_side="left", legacy=False
-                )
-            else:
-                self._cached_tokenizer = AutoTokenizer.from_pretrained(
-                    f"huggyllama/{self.llama_config.name}", padding_side="left", legacy=False
+            # if "68m" in self.llama_config.name:
+            #     self._cached_tokenizer = AutoTokenizer.from_pretrained(
+            #         "JackFram/llama-68m", padding_side="left", legacy=False
+            #     )
+            # else:
+            #     self._cached_tokenizer = AutoTokenizer.from_pretrained(
+            #         f"huggyllama/{self.llama_config.name}", padding_side="left", legacy=False
+            #     )
+            self._cached_tokenizer = AutoTokenizer.from_pretrained(
+                    "huggyllama/llama-7b", padding_side="left", legacy=False
                 )
             self._cached_tokenizer.pad_token = '[PAD]'
         tokenizer = self._cached_tokenizer

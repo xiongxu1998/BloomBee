@@ -61,7 +61,7 @@ def get_llama_config(name, **kwargs):
     elif arch_name == "llama-70b":
         config = LlamaConfig(name=name, hidden_size=8192, num_attention_heads=64, num_hidden_layers=80, intermediate_size=28672)
     elif arch_name == "llama-68m":
-        config = LlamaConfig(name=name, hidden_size=768, num_attention_heads=12, num_hidden_layers=2, intermediate_size=3072)
+        config = LlamaConfig(name=name, hidden_size=768, num_attention_heads=12, num_hidden_layers=2, intermediate_size=3072, dtype=np.float32)
     else:
         raise ValueError(f"Invalid model name: {name}")
     

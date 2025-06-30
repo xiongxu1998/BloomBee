@@ -408,7 +408,13 @@ class FLEX_LlamaAttention(LlamaAttention):
 
     def init_weight(self, weight_home, path):
         h = self.config.hidden_size
-        dtype = self.llama_config.dtype
+        print("init_weight config:", self.config)
+        print("init_weight llama_config:", self.llama_config)
+        dtype = {
+            torch.float32: np.float32,
+            torch.float16: np.float16,
+            torch.bfloat16: np.float16  # fallback for bfloat16
+        }[self.config.torch_dtype]
         
         path = os.path.join(os.path.join(path, f"layers.{self.layer_id}."))
         weight_specs = [
@@ -629,7 +635,13 @@ class FLEX_LlamaMLP(LlamaMLP):
         self.task = task
 
     def init_weight(self, weight_home, path):
-        dtype = self.llama_config.dtype
+        print("init_weight config:", self.config)
+        print("init_weight llama_config:", self.llama_config)
+        dtype = {
+            torch.float32: np.float32,
+            torch.float16: np.float16,
+            torch.bfloat16: np.float16  # fallback for bfloat16
+        }[self.config.torch_dtype]
 
         intermediate_size, h = (self.config.intermediate_size, self.config.hidden_size)
         print('intermediate_size, h, dtype ', intermediate_size, h, dtype)

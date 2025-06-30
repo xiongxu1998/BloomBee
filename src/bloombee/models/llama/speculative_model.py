@@ -6,6 +6,8 @@ from transformers.generation.utils import GenerateNonBeamOutput, GenerationMixin
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.models.llama import LlamaForCausalLM
 from transformers.generation.streamers import BaseStreamer
+from transformers import MaxLengthCriteria
+import torch.nn.functional as F
 
 from bloombee.models.llama.config import DistributedLlamaConfig
 from bloombee.models.llama.model import DistributedLlamaForCausalLM
@@ -24,7 +26,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
         logits_processor: Optional[LogitsProcessorList] = None,
         stopping_criteria: Optional[StoppingCriteriaList] = None,
         streamer: Optional["BaseStreamer"] = None,
-        speculative_inference_iteration_size: int = 3,
+        speculative_inference_iteration_size: int = 4,
+        tokenizer: Optional["PreTrainedTokenizerBase"] = None,
         **model_kwargs,
     ) -> torch.LongTensor:
         """
@@ -32,11 +35,16 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
         """
 
         # 如果没有传配置，则使用默认值
-        generation_config = generation_config or getattr(self, "generation_config", GenerationConfig())
+        generation_config = generation_config or getattr(self, "generation_config", GenerationConfig(
+            eos_token_id=2,
+            pad_token_id=0,
+            max_new_tokens=30,
+            do_sample=False,
+        ))
 
         # 初始化 logits_processor 和 stopping_criteria
         logits_processor = logits_processor or LogitsProcessorList()
-        stopping_criteria = stopping_criteria or StoppingCriteriaList()
+        stopping_criteria = stopping_criteria or StoppingCriteriaList([MaxLengthCriteria(max_length=32)])
 
         # 设置强制参数：关闭 do_sample 等
         generation_config.do_sample = False
@@ -53,8 +61,10 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
             streamer=streamer,
             logits_warper=None,  # 暂不支持 warper
             speculative_inference_iteration_size=speculative_inference_iteration_size,
+            tokenizer=tokenizer,
             **model_kwargs,
         )
+
     def _sample(
         self,
         input_ids: torch.LongTensor,
@@ -65,7 +75,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
         synced_gpus: bool,
         streamer: Optional["BaseStreamer"],
         logits_warper: Optional[LogitsProcessorList],
-        speculative_inference_iteration_size: int = 3,
+        speculative_inference_iteration_size: int = 4,
+        tokenizer: Optional["PreTrainedTokenizerBase"] = None,
         **model_kwargs,
     ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
         assert not generation_config.do_sample, "sample is not working for speculative generation now"
@@ -81,11 +92,19 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
         finished = False
         firsts = True
+        step = 0
 
-        while not finished:
+        while not finished and step < 32:
             # speculative_inference_iteration_size = min(
             #     speculative_inference_iteration_size, self.active_session._max_length - input_ids.shape[1]
             # )
+            print(f"\n--- Step {step} ---")
+            print("Input IDs before generation:", input_ids.tolist())
+            if tokenizer is not None:
+                decoded = tokenizer.batch_decode(input_ids, skip_special_tokens=True, clean_up_tokenization_spaces=True)
+                for i, output in enumerate(decoded):
+                    print(f"\n=== Final Output (batch {i}) ===")
+                    print(output)
             with torch.no_grad():
                 speculative_outputs = ssm.generate(
                     input_ids,
@@ -95,18 +114,20 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
                 # p_result, topk_tokens, topk_scores = self.small_model.generate_topk_proposals(input_ids, top_k=5)
                 speculative_tokens = speculative_outputs[:, -speculative_inference_iteration_size:]
 
+            print("Speculative tokens (SSM generated):", speculative_tokens.tolist())
+            for b in range(speculative_tokens.shape[0]):
+                ids = speculative_tokens[b].tolist()
+                decoded_tokens = [tokenizer.decode([tid]) for tid in ids]
+                joined = " | ".join([repr(t) for t in decoded_tokens])
+                print(f"Decoded speculative tokens (batch {b}): {joined}")
             full_sequence = torch.cat([input_ids, speculative_tokens], dim=-1)
             assert input_ids.shape[1] + speculative_inference_iteration_size == full_sequence.shape[1]
 
-            input_for_validation = full_sequence
-            if not firsts:
-                self.active_session.position = input_ids.shape[1] - 1
-                input_for_validation = input_for_validation[:, -speculative_inference_iteration_size - 1 :]
-            else:
-                firsts = False
-            input_for_validation = input_for_validation[:, :-1]
+            input_for_validation = torch.cat([input_ids, speculative_tokens[:, :-1]], dim=-1)
+            print("input_for_validation", input_for_validation)
             with torch.no_grad():
                 precise_model_outputs = self(input_for_validation)
+            print("precise_model_outputs", precise_model_outputs)
             full_token_logits = precise_model_outputs.logits[:, -speculative_inference_iteration_size:, :].clone()
 
             all_valid_tokens = []
@@ -117,11 +138,22 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
                     input_for_validation[:, : -speculative_inference_iteration_size + 1 + i], token_logits
                 )
                 valid_token = torch.argmax(token_scores, dim=-1)
+                
+                probs = F.softmax(token_scores, dim=-1)  # shape: [batch_size, vocab_size]
+                topk_probs, topk_indices = torch.topk(probs, k=5, dim=-1)
+
+                # 假设 batch_size == 1，可以简洁打印
+                print(f"Token {i} verification:")
+                print("  Speculative token: ", speculative_tokens[:, i].item())
+                print("  LLM argmax token : ", valid_token.item())
+                print("  Top-5 predicted tokens:", topk_indices[0].tolist())
+                print("  Top-5 probs:", [round(p, 4) for p in topk_probs[0].tolist()])
 
                 if first_token is None:
                     first_token = valid_token
 
-                if valid_token.item() == speculative_tokens[:, i].item():
+                matched = (valid_token == speculative_tokens[:, i])  # shape: [B]
+                if torch.all(matched):  # 所有 batch 都要一致
                     all_valid_tokens.append(valid_token.unsqueeze(-1))
                 else:
                     break
@@ -129,6 +161,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
             if not all_valid_tokens and first_token is not None:
                 all_valid_tokens.append(first_token.unsqueeze(-1))
             all_valid_tokens = torch.cat(all_valid_tokens, dim=-1)
+            
+            print("Validated tokens (accepted by LLM):", all_valid_tokens.tolist())
 
             # finished sentences should have their next token be a padding token
             if has_eos_stopping_criteria:
@@ -144,6 +178,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
 
             unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, None)
             finished = unfinished_sequences.max() == 0
+            
+            step += 1
 
             del precise_model_outputs
 

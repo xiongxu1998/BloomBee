@@ -114,7 +114,7 @@ def benchmark_inference(process_idx, args, result_pipe):
     input_ids = input_ids[:, :args.prompt_len]
     logger.info(f"Using initial prompt with {args.prompt_len} tokens: {input_ids.shape}")
     
-    result = model.generate(input_ids=input_ids, ssm=ssm, speculative_inference_iteration_size=5)
+    result = model.generate(input_ids=input_ids, ssm=ssm, speculative_inference_iteration_size=4, tokenizer=tokenizer)
 
     final_speed = 1 / np.mean(step_times) if step_times else 0.0
     result_pipe.send({
