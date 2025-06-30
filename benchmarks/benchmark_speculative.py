@@ -91,6 +91,7 @@ def main():
 @torch.inference_mode()
 def benchmark_inference(process_idx, args, result_pipe):
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+    ssm_tokenizer = AutoTokenizer.from_pretrained(args.ssm, use_fast=False)
     ssm = AutoDistributedModelForCausalLM.from_pretrained(
         args.ssm, initial_peers=args.initial_peers, torch_dtype=DTYPE_MAP["float32"]
     )
@@ -106,6 +107,32 @@ def benchmark_inference(process_idx, args, result_pipe):
     validation_stats = {"total": 0, "passed": 0}
     
     test_prompt = "Hello world from Xu, I am a master student."
+    
+    tokens_main = tokenizer.tokenize(test_prompt)
+    token_ids_main = tokenizer.encode(test_prompt, add_special_tokens=False)
+
+    tokens_ssm = ssm_tokenizer.tokenize(test_prompt)
+    token_ids_ssm = ssm_tokenizer.encode(test_prompt, add_special_tokens=False)
+
+    # Print comparison
+    print("Main tokenizer:")
+    print("Tokens:", tokens_main)
+    print("Token IDs:", token_ids_main)
+    print()
+
+    print("SSM tokenizer:")
+    print("Tokens:", tokens_ssm)
+    print("Token IDs:", token_ids_ssm)
+    print("Main tokenizer config:", tokenizer.init_kwargs)
+    print("SSM tokenizer config:", ssm_tokenizer.init_kwargs)
+    print("Main tokenizer vocab size:", len(tokenizer))
+    print("SSM tokenizer vocab size:", len(ssm_tokenizer))
+
+    print("Are vocabularies equal?", tokenizer.get_vocab() == ssm_tokenizer.get_vocab())
+    print()
+    
+    
+    
     input_ids = tokenizer.encode(test_prompt, return_tensors="pt", add_special_tokens=False)
     # Ensure we have enough tokens, repeat if not enough
     while input_ids.shape[1] < args.prompt_len:
