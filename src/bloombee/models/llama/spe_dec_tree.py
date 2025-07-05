@@ -1,7 +1,7 @@
 import uuid
+import math
 from typing import List, Optional, Dict, Tuple, Any
-from dataclasses import dataclass
-from enum import Enum
+import torch
 
 class TreeNode:
     """推测树的基本节点"""
@@ -12,7 +12,8 @@ class TreeNode:
         self.depth = depth
         self.children: List['TreeNode'] = []
         self.parent: Optional['TreeNode'] = None
-        self.node_id = str(uuid.uuid4())  # 唯一标识符
+        self.node_id = str(uuid.uuid4())
+        self.position_in_sequence = -1
         
     def add_child(self, token_id: int, probability: float) -> 'TreeNode':
         """添加子节点"""
@@ -38,12 +39,12 @@ class TreeNode:
             current = current.parent
         return list(reversed(path))
     
-    def get_path_with_probs(self) -> List[Tuple[int, float]]:
-        """获取路径及对应概率"""
+    def get_path_nodes_from_root(self) -> List['TreeNode']:
+        """获取从根节点到当前节点的节点路径"""
         path = []
         current = self
         while current.parent is not None:
-            path.append((current.token_id, current.probability))
+            path.append(current)
             current = current.parent
         return list(reversed(path))
     
@@ -62,20 +63,21 @@ class TreeNode:
             all_paths.extend(child_paths)
         return all_paths
     
-    def get_subtree_size(self) -> int:
-        """获取子树大小（包括自身）"""
-        size = 1
+    def get_all_leaf_node_paths(self) -> List[List['TreeNode']]:
+        """获取所有从根到叶子的节点路径"""
+        if self.is_leaf():
+            return [self.get_path_nodes_from_root()]
+        
+        all_paths = []
         for child in self.children:
-            size += child.get_subtree_size()
-        return size
+            child_paths = child.get_all_leaf_node_paths()
+            all_paths.extend(child_paths)
+        return all_paths
     
     def __str__(self):
         return f"TreeNode(token={self.token_id}, prob={self.probability:.3f}, depth={self.depth})"
-    
-    def __repr__(self):
-        return self.__str__()
-    
-    
+
+
 class SpeculativeTree:
     """单个请求的推测树"""
     
@@ -101,19 +103,6 @@ class SpeculativeTree:
         traverse(self.root, 0)
         return nodes
     
-    def get_leaf_nodes(self) -> List[TreeNode]:
-        """获取所有叶子节点"""
-        leaves = []
-        def traverse(node):
-            if node.is_leaf():
-                leaves.append(node)
-            else:
-                for child in node.children:
-                    traverse(child)
-        
-        traverse(self.root)
-        return leaves
-    
     def add_layer(self, parent_nodes: List[TreeNode], candidates_per_node: List[List[Tuple[int, float]]]):
         """为指定的父节点添加一层候选"""
         if len(parent_nodes) != len(candidates_per_node):
@@ -124,7 +113,6 @@ class SpeculativeTree:
             children = parent.add_children(candidates)
             new_nodes.extend(children)
             
-        # 更新统计信息
         if new_nodes:
             self.max_depth = max(self.max_depth, max(node.depth for node in new_nodes))
             self.total_nodes += len(new_nodes)
@@ -134,85 +122,153 @@ class SpeculativeTree:
     def get_all_paths(self) -> List[List[int]]:
         """获取所有可能的路径"""
         return self.root.get_all_leaf_paths()
-    
-    def get_all_paths_with_scores(self) -> List[Tuple[List[int], float]]:
-        """获取所有路径及其累积概率"""
-        paths_with_scores = []
+
+
+    def linearize_tree_with_positions(tree: SpeculativeTree) -> Tuple[List[TreeNode], List[int]]:
+        """
+        DFS线性化: 记录父位置
+        """
+        linearized_nodes = []
+        parent_indices = []
+        position_map = {}
         
-        def traverse(node, current_path, current_score):
-            current_path = current_path + [node.token_id] if node.parent else current_path
-            
-            if node.is_leaf():
-                if current_path:  # 排除根节点
-                    paths_with_scores.append((current_path, current_score))
-            else:
-                for child in node.children:
-                    traverse(child, current_path, current_score * child.probability)
-        
-        traverse(self.root, [], 1.0)
-        return paths_with_scores
-    
-    def get_best_path(self) -> Tuple[List[int], float]:
-        """获取概率最高的路径"""
-        paths_with_scores = self.get_all_paths_with_scores()
-        if not paths_with_scores:
-            return [], 0.0
-        
-        return max(paths_with_scores, key=lambda x: x[1])
-    
-    def get_top_k_paths(self, k: int) -> List[Tuple[List[int], float]]:
-        """获取概率最高的k条路径"""
-        paths_with_scores = self.get_all_paths_with_scores()
-        sorted_paths = sorted(paths_with_scores, key=lambda x: x[1], reverse=True)
-        return sorted_paths[:k]
-    
-    def prune_low_probability_branches(self, threshold: float):
-        """剪枝低概率分支"""
-        def should_prune(node):
-            return node.probability < threshold
-        
-        def prune_recursive(node):
-            # 从后往前遍历，避免索引问题
-            for i in range(len(node.children) - 1, -1, -1):
-                child = node.children[i]
-                if should_prune(child):
-                    node.children.pop(i)
-                    self.total_nodes -= child.get_subtree_size()
-                else:
-                    prune_recursive(child)
-        
-        prune_recursive(self.root)
-    
-    def print_tree(self, max_depth: Optional[int] = None):
-        """打印树结构"""
-        def print_node(node, prefix="", is_last=True):
-            if max_depth is not None and node.depth > max_depth:
-                return
+        def dfs_with_positions(node):
+            if node.parent is not None:  # 跳过root
+                pos = len(linearized_nodes)
+                position_map[node] = pos
+                node.position_in_sequence = pos
+                linearized_nodes.append(node)
                 
-            print(f"{prefix}{'└── ' if is_last else '├── '}{node}")
+                parent_pos = position_map.get(node.parent, -1)
+                parent_indices.append(parent_pos)
             
-            if node.children:
-                for i, child in enumerate(node.children):
-                    is_child_last = i == len(node.children) - 1
-                    child_prefix = prefix + ("    " if is_last else "│   ")
-                    print_node(child, child_prefix, is_child_last)
+            for child in node.children:
+                dfs_with_positions(child)
         
-        print(f"SpeculativeTree for request {self.request_id}:")
-        print_node(self.root)
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """序列化为字典"""
-        def node_to_dict(node):
-            return {
-                'token_id': node.token_id,
-                'probability': node.probability,
-                'depth': node.depth,
-                'children': [node_to_dict(child) for child in node.children]
-            }
+        dfs_with_positions(tree.root)
+        return linearized_nodes, parent_indices
+
+
+    def build_ancestor_matrix_optimized(parent_indices: List[int], device: torch.device) -> torch.Tensor:
+        """
+        修复问题1: 使用scatter_和bit-jump优化祖先矩阵构建
+        """
+        n = len(parent_indices)
+        if n == 0:
+            return torch.empty(0, 0, dtype=torch.bool, device=device)
         
-        return {
-            'request_id': self.request_id,
-            'max_depth': self.max_depth,
-            'total_nodes': self.total_nodes,
-            'root': node_to_dict(self.root)
-        }
+        # 使用scatter_一次性构建直接父子关系
+        A = torch.zeros(n, n, dtype=torch.bool, device=device)
+        
+        rows = torch.arange(n, device=device)
+        cols = torch.as_tensor(parent_indices, device=device)
+        mask = cols >= 0  # 有效的父节点
+        
+        if mask.any():
+            A[rows[mask], cols[mask]] = True
+        
+        # 使用bit-jump优化传递闭包
+        ancestor_matrix = A.clone()
+        k = 1
+        
+        while k < n:
+            # 计算k步可达关系
+            power_A = torch.matmul(ancestor_matrix, A)
+            new_reachable = ancestor_matrix | power_A
+            
+            if torch.equal(new_reachable, ancestor_matrix):
+                break
+                
+            ancestor_matrix = new_reachable
+            k *= 2
+        
+        return ancestor_matrix
+
+
+    def build_tree_attention_mask_batched(
+        prefix_len: int,
+        max_tree_size: int,
+        all_parent_indices: List[List[int]],
+        batch_size: int,
+        device: torch.device
+    ) -> torch.Tensor:
+        """
+        修复问题2: 正确处理batch维度的attention mask
+        """
+        total_len = prefix_len + max_tree_size
+        
+        # 为每个batch创建mask
+        mask = torch.tril(torch.ones(total_len, total_len, dtype=torch.bool, device=device))
+        mask = mask.expand(batch_size, -1, -1).clone()  # [batch_size, total_len, total_len]
+        
+        for batch_idx, parent_indices in enumerate(all_parent_indices):
+            tree_len = len(parent_indices)
+            if tree_len == 0:
+                continue
+            
+            # 构建祖先矩阵
+            ancestor_matrix = build_ancestor_matrix_optimized(parent_indices, device)
+            
+            # 批量更新树部分的mask
+            tree_start = prefix_len
+            
+            # 创建索引张量用于批量更新
+            tree_indices = torch.arange(tree_len, device=device)
+            tree_positions_i = tree_start + tree_indices.unsqueeze(1)  # [tree_len, 1]
+            tree_positions_j = tree_start + tree_indices.unsqueeze(0)  # [1, tree_len]
+            
+            # 只有祖先关系或自己的位置才能看到
+            valid_attention = ancestor_matrix | torch.eye(tree_len, dtype=torch.bool, device=device)
+            
+            # 批量更新：无效的attention位置设为False
+            invalid_mask = ~valid_attention
+            if invalid_mask.any():
+                invalid_i = tree_positions_i.expand(tree_len, tree_len)[invalid_mask]
+                invalid_j = tree_positions_j.expand(tree_len, tree_len)[invalid_mask]
+                mask[batch_idx, invalid_i, invalid_j] = False
+        
+        return mask
+
+
+    def prepare_tree_attention_batch(
+        trees: List[SpeculativeTree], 
+        prefix_tokens: torch.Tensor,
+        device: torch.device,
+        pad_token_id: int = 0
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[List[List[TreeNode]]]]:
+        """
+        批量处理多个树的线性化和attention mask构建
+        """
+        batch_size = len(trees)
+        
+        if not trees or all(tree.total_nodes <= 1 for tree in trees):
+            return prefix_tokens, None, [[] for _ in trees]
+        
+        max_tree_size = max(tree.total_nodes - 1 for tree in trees if tree.total_nodes > 1)
+        
+        # 收集线性化结果
+        batch_linearized = []
+        batch_node_paths = []
+        all_parent_indices = []
+        
+        for tree in trees:
+            linearized_nodes, parent_indices = linearize_tree_with_positions(tree)
+            batch_linearized.append([node.token_id for node in linearized_nodes])
+            batch_node_paths.append(tree.root.get_all_leaf_node_paths())
+            all_parent_indices.append(parent_indices)
+        
+        # 填充到相同长度
+        padded_tokens = []
+        for tokens in batch_linearized:
+            padded = tokens + [pad_token_id] * (max_tree_size - len(tokens))
+            padded_tokens.append(padded)
+        
+        tree_tokens = torch.tensor(padded_tokens, device=device)
+        full_sequence = torch.cat([prefix_tokens, tree_tokens], dim=-1)
+        
+        # 构建批量attention mask
+        attention_mask = build_tree_attention_mask_batched(
+            prefix_tokens.shape[1], max_tree_size, all_parent_indices, batch_size, device
+        )
+        
+        return full_sequence, attention_mask, batch_node_paths
