@@ -221,7 +221,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
         if attention_mask is None:
             return self._fallback_generation_improved(input_ids, logits_processor), past_key_values
         
-        new_tokens = full_sequence[:, input_ids.shape[1]:]
+        # new_tokens = full_sequence[:, input_ids.shape[1]:]
         
         with torch.no_grad():
             if not use_kv_cache:
@@ -259,8 +259,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
                     new_past_key_values = past_key_values
                 
                 outputs = self(
-                    input_ids=new_tokens,
-                    attention_mask=None,  # 依赖past_key_values
+                    input_ids=full_sequence,
+                    attention_mask=attention_mask,  # 依赖past_key_values
                     past_key_values=new_past_key_values,
                     use_cache=True
                 )
