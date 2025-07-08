@@ -26,27 +26,6 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
         logits_processor: Optional[LogitsProcessorList] = None,
         stopping_criteria: Optional[StoppingCriteriaList] = None,
         streamer: Optional["BaseStreamer"] = None,
-<<<<<<< Updated upstream
-        speculative_inference_iteration_size: int = 3,
-        **model_kwargs,
-    ) -> torch.LongTensor:
-        """
-        A generate wrapper for speculative decoding.
-        """
-
-        # 如果没有传配置，则使用默认值
-        generation_config = generation_config or getattr(self, "generation_config", GenerationConfig())
-
-        # 初始化 logits_processor 和 stopping_criteria
-        logits_processor = logits_processor or LogitsProcessorList()
-        stopping_criteria = stopping_criteria or StoppingCriteriaList()
-
-        # 设置强制参数：关闭 do_sample 等
-        generation_config.do_sample = False
-        generation_config.return_dict_in_generate = False
-
-        # 调用 _sample 来执行 speculative decoding
-=======
         beam_width: int = 3,
         max_tree_depth: int = 4,
         use_kv_cache: bool = True,
@@ -61,7 +40,6 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
         generation_config.do_sample = False
         generation_config.return_dict_in_generate = False
 
->>>>>>> Stashed changes
         return self._sample(
             input_ids=input_ids,
             ssm=ssm,
@@ -70,12 +48,6 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
             generation_config=generation_config,
             synced_gpus=False,
             streamer=streamer,
-<<<<<<< Updated upstream
-            logits_warper=None,  # 暂不支持 warper
-            speculative_inference_iteration_size=speculative_inference_iteration_size,
-            **model_kwargs,
-        )
-=======
             logits_warper=None,
             beam_width=beam_width,
             max_tree_depth=max_tree_depth,
@@ -84,7 +56,6 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
             **model_kwargs,
         )
         
->>>>>>> Stashed changes
     def _sample(
         self,
         input_ids: torch.LongTensor,
@@ -95,14 +66,10 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
         synced_gpus: bool,
         streamer: Optional["BaseStreamer"],
         logits_warper: Optional[LogitsProcessorList],
-<<<<<<< Updated upstream
-        speculative_inference_iteration_size: int = 3,
-=======
         beam_width: int = 3,
         max_tree_depth: int = 4,
         use_kv_cache: bool = True,
         kv_cache_window: int = 2048,
->>>>>>> Stashed changes
         **model_kwargs,
     ) -> torch.LongTensor:
         logger.info("start sample!!!!")
@@ -117,19 +84,6 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
         step_idx = 0
         
         while not finished:
-<<<<<<< Updated upstream
-            # speculative_inference_iteration_size = min(
-            #     speculative_inference_iteration_size, self.active_session._max_length - input_ids.shape[1]
-            # )
-            with torch.no_grad():
-                speculative_outputs = ssm.generate(
-                    input_ids,
-                    max_new_tokens=speculative_inference_iteration_size,
-                    do_sample=False,
-                )
-                # p_result, topk_tokens, topk_scores = self.small_model.generate_topk_proposals(input_ids, top_k=5)
-                speculative_tokens = speculative_outputs[:, -speculative_inference_iteration_size:]
-=======
             logger.info(f"\n==================== STEP {step_idx} ====================")
             input_ids_p = input_ids.tolist()
             logger.info(f"[DEBUG] Current prefix:  {input_ids_p} ")
@@ -152,7 +106,6 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
                 verified_tokens = verified_tokens * unfinished_sequences + generation_config.pad_token_id * (
                     1 - unfinished_sequences
                 )
->>>>>>> Stashed changes
 
             # 4. 更新输入序列
             input_ids = torch.cat([input_ids, verified_tokens], dim=-1)
