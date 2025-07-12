@@ -128,9 +128,10 @@ class _ServerInferenceSession:
 
         # serialize inputs and put them into the queue
         input_tensors, args_structure = pack_args_kwargs(inputs, prompts, hypo_ids)
-        print('client inference session step() input_tensors after packing ', input_tensors)
-        print('client inference session step() input_tensors after packing shape', input_tensors[0].shape)
-        print('_ServerInferenceSession  step id ', step_id)
+        logger.info(f"client inference session step() input_tensors after packing: {input_tensors}")
+        logger.info(f"client inference session step() input_tensors after packing shape: {input_tensors[0].shape}")
+        logger.info(f"_ServerInferenceSession  step id: {step_id}")
+        logger.info(f"_ServerInferenceSession  args_structure: {args_structure}")
         request_metadata = dict(session_id=self.session_id, step_id=step_id)
         if not self.stepped:
             request_metadata.update(self.session_metadata)

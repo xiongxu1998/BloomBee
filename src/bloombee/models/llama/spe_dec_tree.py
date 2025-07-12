@@ -169,18 +169,21 @@ def build_ancestor_matrix_optimized(parent_indices: List[int], device: torch.dev
     
     # 使用bit-jump优化传递闭包
     ancestor_matrix = A.clone()
-    k = 1
     
-    while k < n:
-        # 计算k步可达关系
-        power_A = torch.matmul(ancestor_matrix, A)
-        new_reachable = ancestor_matrix | power_A
+    # 转换为float进行矩阵运算，然后转回bool
+    for _ in range(n):  # 最多n次迭代就能收敛
+        # 将bool转换为float进行矩阵乘法
+        A_float = A.float()
+        ancestor_float = ancestor_matrix.float()
+        
+        # 计算可达关系
+        power_A = torch.matmul(ancestor_float, A_float)
+        new_reachable = ancestor_matrix | (power_A > 0)  # 转回bool
         
         if torch.equal(new_reachable, ancestor_matrix):
             break
             
         ancestor_matrix = new_reachable
-        k *= 2
     
     return ancestor_matrix
 
@@ -258,7 +261,7 @@ def prepare_incremental_tree_batch(
                 pad_mask = torch.cat([
                     torch.ones(pad_len, past_len, dtype=torch.bool, device=device),
                     torch.zeros(pad_len, max_tree_size, dtype=torch.bool, device=device)
-                ], dim=1).unsqueeze(0)
+                ], dim=1).unsqueeze(0).expand(1, pad_len, past_len + max_tree_size)
                 mask = torch.cat([mask, pad_mask], dim=1)
         else:
             # 空树的情况

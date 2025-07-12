@@ -1,5 +1,6 @@
 from typing import Optional, Union, List, Tuple, Any
 import torch
+import contextlib
 from transformers.generation import GenerationConfig, LogitsProcessorList, StoppingCriteriaList
 from transformers.generation.utils import GenerateNonBeamOutput, GenerationMixin
 from transformers.models.llama import LlamaForCausalLM
@@ -8,15 +9,17 @@ from transformers.generation.streamers import BaseStreamer
 from bloombee.models.llama.spe_dec_tree import SpeculativeTree, TreeNode, prepare_incremental_tree_batch
 from bloombee.models.llama.config import DistributedLlamaConfig
 from bloombee.models.llama.model import DistributedLlamaForCausalLM
+from bloombee.client.remote_generation import RemotePastKeyValues
+from bloombee.client.inference_session import InferenceSession
 
 from hivemind.utils.logging import get_logger
 
 logger = get_logger()
 
 
-class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, GenerationMixin):
+class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
     def __init__(self, config: DistributedLlamaConfig):
-        DistributedLlamaForCausalLM.__init__(self, config)
+        super().__init__(config)
         
     def generate(
         self,
@@ -30,6 +33,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
         max_tree_depth: int = 4,
         use_kv_cache: bool = True,
         kv_cache_window: int = 2048,
+        max_new_tokens: int = 50,
         **model_kwargs,
     ) -> torch.LongTensor:
         
@@ -40,91 +44,252 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
         generation_config.do_sample = False
         generation_config.return_dict_in_generate = False
 
-        return self._sample(
-            input_ids=input_ids,
-            ssm=ssm,
-            logits_processor=logits_processor,
-            stopping_criteria=stopping_criteria,
-            generation_config=generation_config,
-            synced_gpus=False,
-            streamer=streamer,
-            logits_warper=None,
-            beam_width=beam_width,
-            max_tree_depth=max_tree_depth,
-            use_kv_cache=use_kv_cache,
-            kv_cache_window=kv_cache_window,
-            **model_kwargs,
-        )
+        # Calculate session max length - this is critical for distributed inference
+        session_max_length = input_ids.shape[1] + max_new_tokens + kv_cache_window
+        if hasattr(self.transformer.config, 'pre_seq_len'):
+            session_max_length += self.transformer.config.pre_seq_len
+
+        # Use inference session for proper distributed caching
+        with self.transformer.h.inference_session(max_length=session_max_length) as session:
+            return self._sample_with_session(
+                input_ids=input_ids,
+                ssm=ssm,
+                logits_processor=logits_processor,
+                stopping_criteria=stopping_criteria,
+                generation_config=generation_config,
+                session=session,
+                streamer=streamer,
+                beam_width=beam_width,
+                max_tree_depth=max_tree_depth,
+                use_kv_cache=use_kv_cache,
+                kv_cache_window=kv_cache_window,
+                max_new_tokens=max_new_tokens,
+                **model_kwargs,
+            )
         
-    def _sample(
+    def _sample_with_session(
         self,
         input_ids: torch.LongTensor,
         ssm: LlamaForCausalLM,
         logits_processor: LogitsProcessorList,
         stopping_criteria: StoppingCriteriaList,
         generation_config: GenerationConfig,
-        synced_gpus: bool,
+        session: InferenceSession,
         streamer: Optional["BaseStreamer"],
-        logits_warper: Optional[LogitsProcessorList],
         beam_width: int = 3,
         max_tree_depth: int = 4,
         use_kv_cache: bool = True,
         kv_cache_window: int = 2048,
+        max_new_tokens: int = 50,
         **model_kwargs,
     ) -> torch.LongTensor:
-        logger.info("start sample!!!!")
+        logger.info("Starting speculative decoding with distributed inference session!")
+        
         has_eos_stopping_criteria = any(hasattr(criteria, "eos_token_id") for criteria in stopping_criteria)
         batch_size = input_ids.shape[0]
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
         finished = False
         
-        # 高效KV cache管理
-        past_key_values = None
+        # Initialize past_key_values for session tracking
+        past_key_values = RemotePastKeyValues()
+        past_key_values.update_seen(session.position)
+        
         is_first_iteration = True
         step_idx = 0
+        current_input_ids = input_ids
         
-        while not finished:
+        while not finished and current_input_ids.shape[1] < input_ids.shape[1] + max_new_tokens:
             logger.info(f"\n==================== STEP {step_idx} ====================")
-            input_ids_p = input_ids.tolist()
-            logger.info(f"[DEBUG] Current prefix:  {input_ids_p} ")
+            logger.info(f"[DEBUG] Current sequence length: {current_input_ids.shape[1]}")
+            logger.info(f"[DEBUG] Session position: {session.position}")
             
-            # 1. 构建推测树
+            # 1. Build speculative trees using SSM
             spec_trees = self._build_speculative_trees_batched(
-                input_ids, ssm, beam_width, max_tree_depth
+                current_input_ids, ssm, beam_width, max_tree_depth
             )
             
-            # 2. 验证树（方案B：高效增量KV cache）
-            verified_tokens, past_key_values = self._verify_trees_incremental_efficient(
-                input_ids, spec_trees, logits_processor, past_key_values, 
-                is_first_iteration, use_kv_cache, kv_cache_window
+            # 2. Verify trees using distributed inference - but through forward() call
+            verified_tokens, past_key_values = self._verify_trees_with_forward(
+                input_ids=current_input_ids,
+                trees=spec_trees,
+                logits_processor=logits_processor,
+                past_key_values=past_key_values,
+                is_first_iteration=is_first_iteration,
+                use_kv_cache=use_kv_cache,
+                kv_cache_window=kv_cache_window
             )
             
             is_first_iteration = False
             
-            # 3. 应用停止条件
+            # 3. Apply stopping conditions
             if has_eos_stopping_criteria:
                 verified_tokens = verified_tokens * unfinished_sequences + generation_config.pad_token_id * (
                     1 - unfinished_sequences
                 )
 
-            # 4. 更新输入序列
-            input_ids = torch.cat([input_ids, verified_tokens], dim=-1)
-            print("[DEBUG] Verified tokens appended:", verified_tokens.tolist())
-            print("[DEBUG] New sequence:", input_ids.tolist())
+            # 4. Update input sequence
+            current_input_ids = torch.cat([current_input_ids, verified_tokens], dim=-1)
+            logger.info(f"[DEBUG] Verified tokens appended: {verified_tokens.tolist()}")
+            logger.info(f"[DEBUG] New sequence length: {current_input_ids.shape[1]}")
 
             if streamer is not None:
                 streamer.put(verified_tokens.cpu())
 
-            # 5. 检查是否完成
-            unfinished_sequences = unfinished_sequences & ~stopping_criteria(input_ids, None)
+            # 5. Check if finished
+            unfinished_sequences = unfinished_sequences & ~stopping_criteria(current_input_ids, None)
             finished = unfinished_sequences.max() == 0
-            step_idx = step_idx + 1
+            step_idx += 1
 
         if streamer is not None:
             streamer.end()
 
-        return input_ids
+        return current_input_ids
     
+    def _verify_trees_with_forward(
+        self,
+        input_ids: torch.LongTensor,
+        trees: List[SpeculativeTree],
+        logits_processor: LogitsProcessorList,
+        past_key_values: RemotePastKeyValues,
+        is_first_iteration: bool,
+        use_kv_cache: bool,
+        kv_cache_window: int,
+    ) -> Tuple[torch.LongTensor, RemotePastKeyValues]:
+        """
+        Verify speculative trees using standard forward() call within the active session context
+        """
+        
+        tree_tokens, attention_mask, batch_node_paths = prepare_incremental_tree_batch(
+            trees, input_ids, input_ids.device
+        )
+        
+        if attention_mask is None or tree_tokens.shape[1] == 0:
+            logger.warning("No tree tokens to verify, falling back to regular generation")
+            return self._fallback_generation_with_forward(input_ids, logits_processor, past_key_values), past_key_values
+        
+        logger.info(f"[DEBUG] Tree tokens shape: {tree_tokens.shape}")
+        logger.info(f"[DEBUG] Active session position: {self.transformer.h.active_session.position if self.transformer.h.active_session else 'None'}")
+        
+        with torch.no_grad():
+            if not use_kv_cache:
+                # No cache: process tree tokens directly
+                logger.warning("Processing without KV cache, may cause error!!!")
+                outputs = self(
+                    input_ids=tree_tokens,
+                    attention_mask=None,
+                    past_key_values=None,
+                    use_cache=False
+                )
+                logits = outputs.logits
+                new_past_key_values = past_key_values
+                
+            elif is_first_iteration or past_key_values is None:
+                # First iteration: process full sequence to establish cache
+                full_sequence = torch.cat([input_ids, tree_tokens], dim=-1)
+                logger.info(f"[DEBUG] First iteration - processing full sequence of length: {full_sequence.shape[1]}")
+                
+                outputs = self(
+                    input_ids=full_sequence,
+                    attention_mask=None,  # Let the session handle attention
+                    past_key_values=None,  # Start fresh
+                    use_cache=True
+                )
+                
+                # Extract only the tree portion of the logits
+                logits = outputs.logits[:, input_ids.shape[1]:, :]
+                
+                # Update past_key_values tracking
+                if past_key_values is None:
+                    new_past_key_values = RemotePastKeyValues()
+                else:
+                    new_past_key_values = past_key_values
+                
+                # The session will automatically handle the KV cache positioning
+                if self.transformer.h.active_session:
+                    new_past_key_values.update_seen(self.transformer.h.active_session.position)
+                
+                logger.info(f"[DEBUG] First iteration completed, session position: {self.transformer.h.active_session.position if self.transformer.h.active_session else 'None'}")
+                
+            else:
+                # Subsequent iterations: use existing cache
+                active_session = self.transformer.h.active_session
+                if active_session is None:
+                    raise ValueError("No active session available for cached inference")
+                
+                # Handle cache window management
+                if active_session.position > kv_cache_window:
+                    trim_amount = active_session.position - kv_cache_window
+                    active_session.position = kv_cache_window
+                    logger.info(f"Trimmed cache: reset position from {active_session.position + trim_amount} to {kv_cache_window}")
+                
+                logger.info(f"[DEBUG] Subsequent iteration - processing tree tokens of length: {tree_tokens.shape[1]}")
+                
+                # Process tree tokens with existing cache
+                outputs = self(
+                    input_ids=tree_tokens,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    use_cache=True
+                )
+                
+                logits = outputs.logits
+                new_past_key_values = past_key_values
+                new_past_key_values.update_seen(active_session.position)
+                
+                logger.info(f"[DEBUG] Subsequent iteration completed, session position: {active_session.position}")
+        
+        # Extract verification results
+        verified_tokens = self._extract_best_verified_paths_fixed(
+            logits, batch_node_paths, input_ids, logits_processor
+        )
+        logger.info(f"[DEBUG] Verified tokens (per batch): {verified_tokens.tolist()}")
+        return verified_tokens, new_past_key_values
+    
+    def _fallback_generation_with_forward(
+        self, 
+        input_ids: torch.LongTensor, 
+        logits_processor: LogitsProcessorList,
+        past_key_values: RemotePastKeyValues,
+        temperature: float = 1.0
+    ) -> torch.LongTensor:
+        """
+        Fallback to regular generation using forward() call within active session
+        """
+        try:
+            logger.info("[DEBUG] Using fallback generation")
+            
+            # Generate single token using standard forward call
+            outputs = self(
+                input_ids=input_ids[:, -1:],  # Just the last token
+                attention_mask=None,
+                past_key_values=past_key_values,
+                use_cache=True
+            )
+            
+            logits = outputs.logits[:, -1, :]  # Last position logits
+            
+            # Apply logits processors
+            processed_logits = logits
+            for processor in logits_processor:
+                processed_logits = processor(input_ids, processed_logits)
+            
+            # Sample next token
+            if temperature > 0:
+                probs = torch.softmax(processed_logits / temperature, dim=-1)
+                next_token = torch.multinomial(probs, 1)
+            else:
+                next_token = torch.argmax(processed_logits, dim=-1, keepdim=True)
+            
+            logger.info(f"[DEBUG] Fallback generated token: {next_token.tolist()}")
+            return next_token
+            
+        except Exception as e:
+            logger.error(f"Fallback generation failed: {e}")
+            # Ultimate fallback - return EOS token
+            eos_token_id = getattr(self.config, 'eos_token_id', 2)
+            return torch.tensor([[eos_token_id]], device=input_ids.device)
+    
+    # Keep your existing methods with minimal changes
     def _build_speculative_trees_batched(
         self, 
         input_ids: torch.LongTensor, 
@@ -132,10 +297,11 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
         beam_width: int, 
         max_depth: int
     ) -> List[SpeculativeTree]:
-        """构建推测树（已优化的版本）"""
+        """Build speculative trees using the small model (SSM)"""
         batch_size = input_ids.shape[0]
         trees = []
-        logger.info(f"batch_size: {batch_size}")
+        logger.info(f"Building trees for batch_size: {batch_size}")
+        
         for batch_idx in range(batch_size):
             root_token = input_ids[batch_idx, -1].item()
             tree = SpeculativeTree(root_token, f"req_{batch_idx}")
@@ -146,7 +312,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
                 if not current_nodes:
                     break
                 
-                # 批量构建contexts
+                # Build contexts for current nodes
                 contexts = []
                 for node in current_nodes:
                     path_to_node = node.get_path_from_root()
@@ -159,17 +325,14 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
                 if not contexts:
                     break
                 
-                # 正确的padding和attention mask
+                # Batch process contexts with SSM
                 max_len = max(len(ctx) for ctx in contexts)
                 padded_contexts = []
                 attention_masks = []
                 
                 for ctx in contexts:
                     pad_len = max_len - len(ctx)
-                    if hasattr(ssm.config, 'pad_token_id') and ssm.config.pad_token_id is not None:
-                        pad_token_id = ssm.config.pad_token_id
-                    else:
-                        pad_token_id = 0
+                    pad_token_id = getattr(ssm.config, 'pad_token_id', 0)
                     
                     padded = torch.cat([
                         torch.full((pad_len,), pad_token_id, dtype=torch.long, device=input_ids.device),
@@ -187,11 +350,12 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
                 batch_contexts = torch.stack(padded_contexts)
                 batch_masks = torch.stack(attention_masks)
                 
+                # Process with SSM (small model)
                 with torch.no_grad():
                     outputs = ssm(batch_contexts, attention_mask=batch_masks)
                     batch_logits = outputs.logits[:, -1, :]
                 
-                # 生成候选
+                # Generate candidates
                 candidates_per_node = []
                 for i in range(len(current_nodes)):
                     logits = batch_logits[i]
@@ -206,217 +370,20 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
                     
                     candidates_per_node.append(candidates)
                 
-                logger.info(
-                    f"[DEBUG] (batch {batch_idx}) depth {depth} SSM candidates: {candidates_per_node}"
-                )
+                logger.info(f"[DEBUG] (batch {batch_idx}) depth {depth} SSM candidates: {candidates_per_node}")
+                
                 try:
                     new_nodes = tree.add_layer(current_nodes, candidates_per_node)
                     if not new_nodes:
                         break
-                except ValueError:
+                except ValueError as e:
+                    logger.warning(f"Failed to add tree layer: {e}")
                     break
             
-            logger.info(f"[DEBUG] batch {batch_idx} finished tree:\n {tree}")
+            logger.info(f"[DEBUG] batch {batch_idx} finished tree structure")
             trees.append(tree)
         
         return trees
-    
-    def _verify_trees_incremental_efficient(
-        self,
-        input_ids: torch.LongTensor,
-        trees: List[SpeculativeTree],
-        logits_processor: LogitsProcessorList,
-        past_key_values: Optional[Any],
-        is_first_iteration: bool,
-        use_kv_cache: bool,
-        kv_cache_window: int
-    ) -> Tuple[torch.LongTensor, Any]:
-        """
-        方案B: 高效增量KV cache推理 - 核心修复
-        """
-        
-        tree_tokens, attention_mask, batch_node_paths = prepare_incremental_tree_batch(
-            trees, input_ids, input_ids.device
-        )
-        
-        if attention_mask is None or tree_tokens.shape[1] == 0:
-            return self._fallback_generation_improved(input_ids, logits_processor), past_key_values
-        
-        with torch.no_grad():
-            if not use_kv_cache:
-                # 不使用cache：直接处理树tokens
-                outputs = self(
-                    input_ids=tree_tokens,
-                    attention_mask=None,
-                    past_key_values=None,
-                    use_cache=False
-                )
-                logits = outputs.logits
-                new_past_key_values = None
-                
-            elif is_first_iteration or past_key_values is None:
-                # 首轮：直接处理full_sequence获取完整KV
-                full_sequence = torch.cat([input_ids, tree_tokens], dim=-1)
-                outputs = self(
-                    input_ids=full_sequence,
-                    attention_mask=None,  # 首轮用标准下三角mask即可
-                    past_key_values=None,
-                    use_cache=True
-                )
-                # 提取树部分的logits
-                logits = outputs.logits[:, input_ids.shape[1]:, :]
-                # 只保留到prefix结尾的KV，丢弃树部分的KV
-                prefix_len = input_ids.shape[1]
-                # new_past_key_values = tuple(
-                #     (k[..., :prefix_len, :], v[..., :prefix_len, :])
-                #     for k, v in outputs.past_key_values
-                # )
-                
-                print("DEBUG cache layer 0 type:", type(outputs.past_key_values[0]))
-                print("DEBUG cache layer 0 elem0 type:", type(outputs.past_key_values[0][0]))
-
-                # new_past_key_values = tuple(
-                #     self._slice_layer_cache(layer, prefix_len)
-                #     for layer in outputs.past_key_values
-                # )
-                self.inspect_kv_cache(outputs.past_key_values)
-                new_past_key_values = outputs.past_key_values
-
-                
-            else:
-                # 后续轮次：直接用cache处理树
-                # KV cache窗口管理
-                if past_key_values and past_key_values[0][0].size(-2) > kv_cache_window:
-                    # 剪裁KV cache
-                    trimmed_past_key_values = tuple(
-                        (k[..., -kv_cache_window:, :], v[..., -kv_cache_window:, :]) 
-                        for k, v in past_key_values
-                    )
-                    # 重新计算对应的past_len
-                    past_len_trimmed = kv_cache_window
-                    
-                    # 重新构建attention mask以匹配trimmed cache
-                    tree_tokens_retrimmed, attention_mask_retrimmed, _ = prepare_incremental_tree_batch(
-                        trees, input_ids[:, -past_len_trimmed:], input_ids.device
-                    )
-                    
-                    outputs = self(
-                        input_ids=tree_tokens_retrimmed,
-                        attention_mask=attention_mask_retrimmed,
-                        past_key_values=trimmed_past_key_values,
-                        use_cache=True
-                    )
-                else:
-                    # 核心修复：只传树tokens，不传full_sequence
-                    outputs = self(
-                        input_ids=tree_tokens,
-                        attention_mask=attention_mask,
-                        past_key_values=past_key_values,
-                        use_cache=True
-                    )
-                self.inspect_kv_cache(outputs.past_key_values)
-                logits = outputs.logits
-                new_past_key_values = outputs.past_key_values
-        
-        # 提取验证结果
-        verified_tokens = self._extract_best_verified_paths_fixed(
-            logits, batch_node_paths, input_ids, logits_processor
-        )
-        logger.info(f"[DEBUG] Verified tokens (per batch): {verified_tokens.tolist()}")
-        return verified_tokens, new_past_key_values
-    
-    def inspect_kv_cache(self, pk, max_layers=2, max_tokens=3):
-        """
-        pk = outputs.past_key_values
-        只查看前 max_layers 层，避免输出过大。
-        """
-        for layer_idx, layer in enumerate(pk[:max_layers]):
-            logger.info(f"\n===== layer {layer_idx} =====")
-            
-            # 1. (k, v) tuple 或 list
-            if isinstance(layer, (tuple, list)) and len(layer) == 2 and torch.is_tensor(layer[0]):
-                k, v = layer
-                logger.info("format: (k, v) tuple/list")
-                logger.info(f"  k.shape: {tuple(k.shape)}, v.shape: {tuple(v.shape)}")
-                logger.info(f"  first k[0,0,:3]: {k[0,0,:max_tokens].tolist()}")
-            
-            # 2. list 包 tuple/list
-            elif isinstance(layer, list) and len(layer) \
-                and isinstance(layer[0], (tuple, list)):
-                logger.info("format: nested list of (k,v)")
-                for i, (k, v) in enumerate(layer[:1]):   # 只看第一个头
-                    logger.info(f"  head {i}: k.shape {tuple(k.shape)}, v.shape {tuple(v.shape)}")
-            
-            # 3. list[Tensor]（paged-attention 索引或 stacked kv）
-            elif isinstance(layer, list) and len(layer) == 1 and torch.is_tensor(layer[0]):
-                t = layer[0]
-                logger.info("format: list[Tensor]  —  stacked or meta-index")
-                logger.info(f"  tensor.shape: {tuple(t.shape)} dim:  {t.dim()}")
-            
-            # 4. 直接是 Tensor（[2, n_heads, seq, dim]）
-            elif torch.is_tensor(layer):
-                logger.info("format: stacked Tensor")
-                logger.info(f"  shape: {tuple(layer.shape)}")
-            
-            else:
-                logger.info(f"format: unknown {type(layer)}")
-    
-    def _slice_layer_cache(self, layer, prefix_len):
-        """
-        Slice a past-kv *layer* down to prefix_len tokens, whatever shape HF
-        decided to give us.  Returns something that your model will accept
-        unchanged on the next `forward(use_cache=True)` call.
-        """
-        import torch
-
-        # ---- 1. (k,v) tuple -------------------------------------------------
-        if isinstance(layer, tuple) and len(layer) == 2 and torch.is_tensor(layer[0]):
-            k, v = layer
-            return (k[..., :prefix_len, :], v[..., :prefix_len, :])
-
-        # ---- 2. list [k,v] (same as above but list) -------------------------
-        if isinstance(layer, list) and len(layer) == 2 and torch.is_tensor(layer[0]):
-            k, v = layer
-            return (k[..., :prefix_len, :], v[..., :prefix_len, :])
-
-        # ---- 3. Hugging Face Cache object -----------------------------------
-        if hasattr(layer, "key") and hasattr(layer, "value"):
-            return (layer.key[..., :prefix_len, :],
-                    layer.value[..., :prefix_len, :])
-
-        # ---- 4. nested list: [(k,v), (k,v), ...]  or  [[k,v], [k,v], ...] ---
-        if isinstance(layer, list) and len(layer) and (
-            isinstance(layer[0], (tuple, list))
-        ):
-            sliced = []
-            for pair in layer:
-                if not (isinstance(pair, (tuple, list)) and len(pair) == 2):
-                    raise TypeError(
-                        f"Nested cache item has unexpected shape {type(pair)} len={len(pair)}"
-                    )
-                k, v = pair
-                sliced.append((k[..., :prefix_len, :], v[..., :prefix_len, :]))
-            return sliced
-        
-        # --- ✱ 5. list [tensor]  --------------------------------------------
-        if isinstance(layer, list) and len(layer) == 1 and torch.is_tensor(layer[0]):
-            t = layer[0]
-            if t.dim() >= 4 and t.size(0) == 2:
-                k, v = t[0], t[1]
-                return (k[..., :prefix_len, :], v[..., :prefix_len, :])
-
-            # ── case 5b: something else (paged-attention meta, single-dim etc.) ─
-            #   → don’t slice; just keep the original list wrapper
-            return layer
-
-        # ---- 5. stacked tensor shape [2, heads, seq, dim] -------------------
-        if isinstance(layer, torch.Tensor) and layer.size(0) == 2:
-            k, v = layer[0], layer[1]
-            return (k[..., :prefix_len, :], v[..., :prefix_len, :])
-
-        raise TypeError(f"Un-recognised cache format: {type(layer)}")
-
-
     
     def _extract_best_verified_paths_fixed(
         self,
@@ -426,7 +393,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
         logits_processor: LogitsProcessorList
     ) -> torch.Tensor:
         """
-        正确处理空验证序列和最终token processor
+        Extract best verified paths with proper error handling
         """
         batch_size = logits.shape[0]
         batch_verified = []
@@ -457,13 +424,19 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
             
             batch_verified.append(best_verified)
         
-        # 安全的长度计算
+        # Handle empty verification case
         best_len = max((len(v) for v in batch_verified), default=0)
         if best_len == 0:
-            # 没有验证通过的tokens，生成一个新token
-            return self._fallback_generation_improved(input_ids, logits_processor)
+            logger.warning("No tokens verified, generating single token using logits processor")
+            # Generate a single token using the last position logits
+            final_logits = logits[:, -1, :]
+            processed_logits = final_logits
+            for processor in logits_processor:
+                processed_logits = processor(input_ids, processed_logits)
+            next_token = torch.argmax(processed_logits, dim=-1, keepdim=True)
+            return next_token
         
-        # 填充到相同长度
+        # Pad to same length
         padded_verified = []
         for verified in batch_verified:
             padded = verified + [0] * (best_len - len(verified))
@@ -471,48 +444,25 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM, Gene
         
         verified_tensor = torch.tensor(padded_verified, device=logits.device)
         
-        # 处理最终token processor
+        # Generate additional token using logits processor
         if verified_tensor.shape[1] > 0:
-            # 使用验证序列的最后位置logits来生成下一个token
+            # Use the position after last verified token
             final_positions = []
             for v in batch_verified:
-                pos = len(v) - 1
-                if pos < 0:  # 保护：防止全失败但被pad的情况
-                    pos = logits.shape[1] - 1
+                pos = len(v) if len(v) < logits.shape[1] else logits.shape[1] - 1
                 final_positions.append(pos)
             
             final_logits = torch.stack([
                 logits[i, pos] for i, pos in enumerate(final_positions)
             ])
             
-            # processor输入：完整的当前序列
+            # Apply logits processor
             processor_input = torch.cat([input_ids, verified_tensor], dim=1)
-            processed_logits = logits_processor(processor_input, final_logits)
+            processed_logits = final_logits
+            for processor in logits_processor:
+                processed_logits = processor(processor_input, processed_logits)
             
             next_token = torch.argmax(processed_logits, dim=-1, keepdim=True)
-            
-            # 拼接而非覆盖
             verified_tensor = torch.cat([verified_tensor, next_token], dim=1)
         
         return verified_tensor
-    
-    def _fallback_generation_improved(
-        self, 
-        input_ids: torch.LongTensor, 
-        logits_processor: LogitsProcessorList,
-        temperature: float = 1.0
-    ) -> torch.LongTensor:
-        """改进的fallback生成"""
-        with torch.no_grad():
-            outputs = self(input_ids)
-            logits = outputs.logits[:, -1, :]
-            
-            processed_logits = logits_processor(input_ids, logits)
-            
-            if temperature > 0:
-                probs = torch.softmax(processed_logits / temperature, dim=-1)
-                next_token = torch.multinomial(probs, 1)
-            else:
-                next_token = torch.argmax(processed_logits, dim=-1, keepdim=True)
-            
-            return next_token

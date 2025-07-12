@@ -20,6 +20,8 @@ from bloombee import (
 )
 from bloombee.constants import DTYPE_MAP, PUBLIC_INITIAL_PEERS
 
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
 logger = get_logger()
 
 def main():
@@ -91,11 +93,11 @@ def main():
 @torch.inference_mode()
 def benchmark_inference(process_idx, args, result_pipe):
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
-    ssm = AutoDistributedModelForCausalLM.from_pretrained(
-        args.ssm, initial_peers=args.initial_peers, torch_dtype=DTYPE_MAP[args.torch_dtype]
-    )
+    
+    ssm = AutoModelForCausalLM.from_pretrained(args.ssm)
+    
     model = AutoDistributedSpeculativeModel.from_pretrained(
-        args.model, initial_peers=args.initial_peers, torch_dtype=DTYPE_MAP[args.torch_dtype], small_model=args.ssm
+        args.model, initial_peers=args.initial_peers, torch_dtype=DTYPE_MAP[args.torch_dtype]
     )
     
     
@@ -114,7 +116,7 @@ def benchmark_inference(process_idx, args, result_pipe):
     input_ids = input_ids[:, :args.prompt_len]
     logger.info(f"Using initial prompt with {args.prompt_len} tokens: {input_ids.shape}")
     
-    result = model.generate(input_ids=input_ids, speculative_inference_iteration_size=5)
+    result = model.generate(input_ids=input_ids, ssm=ssm)
 
     final_speed = 1 / np.mean(step_times) if step_times else 0.0
     result_pipe.send({
