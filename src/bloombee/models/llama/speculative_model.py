@@ -1,5 +1,6 @@
 from typing import Optional, Union, List, Tuple, Any
 import torch
+import numpy as np
 import contextlib
 from transformers.generation import GenerationConfig, LogitsProcessorList, StoppingCriteriaList
 from transformers.generation.utils import GenerateNonBeamOutput, GenerationMixin
@@ -29,8 +30,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         logits_processor: Optional[LogitsProcessorList] = None,
         stopping_criteria: Optional[StoppingCriteriaList] = None,
         streamer: Optional["BaseStreamer"] = None,
-        beam_width: int = 3,
-        max_tree_depth: int = 4,
+        beam_width: int = 2,
+        max_tree_depth: int = 2,
         use_kv_cache: bool = True,
         kv_cache_window: int = 2048,
         max_new_tokens: int = 50,
@@ -45,9 +46,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         generation_config.return_dict_in_generate = False
 
         # Calculate session max length - this is critical for distributed inference
-        session_max_length = input_ids.shape[1] + max_new_tokens + kv_cache_window
-        if hasattr(self.transformer.config, 'pre_seq_len'):
-            session_max_length += self.transformer.config.pre_seq_len
+        session_max_length = 128
 
         # Use inference session for proper distributed caching
         with self.transformer.h.inference_session(max_length=session_max_length) as session:
@@ -76,8 +75,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         generation_config: GenerationConfig,
         session: InferenceSession,
         streamer: Optional["BaseStreamer"],
-        beam_width: int = 3,
-        max_tree_depth: int = 4,
+        beam_width: int = 2,
+        max_tree_depth: int = 2,
         use_kv_cache: bool = True,
         kv_cache_window: int = 2048,
         max_new_tokens: int = 50,
@@ -163,12 +162,17 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             trees, input_ids, input_ids.device
         )
         
+        logger.info(f"[DEBUG] Tree tokens shape: {tree_tokens.shape}")
+        logger.info(f"[DEBUG] Tree tokens: {tree_tokens}")
+        logger.info(f"[DEBUG] Active session position: {self.transformer.h.active_session.position if self.transformer.h.active_session else 'None'}")
+        
         if attention_mask is None or tree_tokens.shape[1] == 0:
             logger.warning("No tree tokens to verify, falling back to regular generation")
             return self._fallback_generation_with_forward(input_ids, logits_processor, past_key_values), past_key_values
         
-        logger.info(f"[DEBUG] Tree tokens shape: {tree_tokens.shape}")
-        logger.info(f"[DEBUG] Active session position: {self.transformer.h.active_session.position if self.transformer.h.active_session else 'None'}")
+        logger.info(f"attention_mask: {attention_mask}")
+        tree_mask_packed = self.pack_bool_mask_to_int64(attention_mask)
+        logger.info(f"tree_mask_packed: {tree_mask_packed}")
         
         with torch.no_grad():
             if not use_kv_cache:
@@ -176,7 +180,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 logger.warning("Processing without KV cache, may cause error!!!")
                 outputs = self(
                     input_ids=tree_tokens,
-                    attention_mask=None,
+                    attention_mask=tree_mask_packed,
                     past_key_values=None,
                     use_cache=False
                 )
@@ -190,7 +194,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 
                 outputs = self(
                     input_ids=full_sequence,
-                    attention_mask=None,  # Let the session handle attention
+                    attention_mask=tree_mask_packed,  # Let the session handle attention
                     past_key_values=None,  # Start fresh
                     use_cache=True
                 )
@@ -227,7 +231,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 # Process tree tokens with existing cache
                 outputs = self(
                     input_ids=tree_tokens,
-                    attention_mask=attention_mask,
+                    attention_mask=tree_mask_packed,
                     past_key_values=past_key_values,
                     use_cache=True
                 )
@@ -244,6 +248,14 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         )
         logger.info(f"[DEBUG] Verified tokens (per batch): {verified_tokens.tolist()}")
         return verified_tokens, new_past_key_values
+    
+    def pack_bool_mask_to_int64(self, mask_bool: torch.Tensor) -> torch.Tensor:
+        packed = np.packbits(mask_bool.cpu().numpy().astype(np.uint8), axis=-1)
+        pad = (-packed.shape[-1]) % 8
+        if pad:
+            packed = np.pad(packed, [(0,0)]*(packed.ndim-1)+[(0,pad)], constant_values=0)
+        packed = packed.reshape(*packed.shape[:-1], -1, 8)
+        return torch.from_numpy(packed).to(mask_bool.device)
     
     def _fallback_generation_with_forward(
         self, 

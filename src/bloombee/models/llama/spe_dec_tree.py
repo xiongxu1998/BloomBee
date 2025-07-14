@@ -202,7 +202,7 @@ def build_incremental_tree_attention_mask(
         return torch.empty(0, past_len, dtype=torch.bool, device=device)
     
     # 左侧：树节点可以看到所有past tokens
-    left_mask = torch.ones(tree_len, past_len, dtype=torch.bool, device=device)
+    # left_mask = torch.ones(tree_len, past_len, dtype=torch.bool, device=device)
     
     # 右侧：树内部的祖先关系
     if len(parent_indices) > 0:
@@ -213,9 +213,9 @@ def build_incremental_tree_attention_mask(
         tree_mask = torch.eye(tree_len, dtype=torch.bool, device=device)
     
     # 拼接: [tree_len, past_len + tree_len]
-    full_mask = torch.cat([left_mask, tree_mask], dim=1)
+    # full_mask = torch.cat([left_mask, tree_mask], dim=1)
     
-    return full_mask.unsqueeze(0)  # [1, tree_len, past_len + tree_len]
+    return tree_mask.unsqueeze(0)  # [1, tree_len, past_len + tree_len]
 
 
 def prepare_incremental_tree_batch(

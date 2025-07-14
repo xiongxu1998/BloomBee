@@ -195,18 +195,30 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             see_memory_usage("transformer backend inference step : seq_len")
             output_hidden_states = torch.empty_like(hidden_states) if seq_len > max_chunk_length else None # 初始化输出状态
             # print("transformer backend inference step : output_hidden_states", output_hidden_states) # output_hidden_states:None
-            layer_past = self._select_layer_past(cache_tensors, inference_info.prefix_length) # 选择上一个层的缓存状态 
+            layer_past = self._select_layer_past(cache_tensors, inference_info.prefix_length) # 选择上一个层的缓存状态
+            logger.info(f"tree_attention_mask: {inference_info.tree_attention_mask}, prefix_length: {inference_info.prefix_length}, seq_len: {seq_len}")
+            full_mask = self._create_attention_mask(
+                tree_attention_mask=inference_info.tree_attention_mask,
+                src_len=inference_info.prefix_length + seq_len,
+                device=hidden_states.device,
+            )
+            logger.info(f"tree_attention_mask full_mask: {full_mask}")
             for offset in range(0, seq_len, max_chunk_length): # 遍历序列以按块处理隐藏状态   only run offset=0
                 hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :] # 获取当前的隐藏状态块 
+                chunk_len = min(max_chunk_length, seq_len - offset)
                 print('transformer backend inference step() offset ', offset )
                 print('transformer backend inference step() offset + max_chunk_length',  (offset + max_chunk_length))
                 # output_hidden_states_chunk, new_kvs = self.module.forward(
                 #     hidden_states_chunk, layer_past=layer_past, use_cache=True # 前向传播，返回新的键值状态  
                 # )
                 # import pdb;pdb.set_trace()
+                if full_mask is not None:
+                    attention_mask = full_mask[:, :inference_info.prefix_length + offset + chunk_len]
+                else:
+                    attention_mask = None
                 see_memory_usage("----before -transformer backend inference step output_hidden_states_chunk,= self.module.forward(")
                 output_hidden_states_chunk,= self.module.forward(
-                    hidden_states_chunk, layer_past=layer_past, use_cache=False # 前向传播，返回新的键值状态  
+                    hidden_states_chunk, layer_past=layer_past, attention_mask=attention_mask, use_cache=False # 前向传播，返回新的键值状态  
                 )
                 see_memory_usage("----after -transformer backend inference step output_hidden_states_chunk,= self.module.forward(")
                 
@@ -228,6 +240,62 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         worst_case_length = inference_info.prefix_length + seq_length
         attn_bytes_per_token = max(self.shard_num_heads) * batch_size * self.dtype_bytes * worst_case_length
         return max(1, self.max_chunk_size_bytes // attn_bytes_per_token)
+    
+    def _create_attention_mask(
+        self,
+        tree_attention_mask: Optional[torch.Tensor],
+        *,
+        src_len: int,                # prefix_len + tree_len
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if tree_attention_mask is None or is_dummy(tree_attention_mask):
+            return None
+
+        # ---- 1. 解包树段 ----
+        if tree_attention_mask.dtype != torch.uint8:
+            raise TypeError("tree_attention_mask should be uint8 packed")
+
+        if hasattr(torch, "unpackbits"):
+            bits = torch.unpackbits(tree_attention_mask.to(device), dim=-1)
+        else:
+            bits = self._unpackbits_fallback(tree_attention_mask.to(device), dim=-1)
+
+        # bits: [B, tree_len, n_chunks, 64]
+        logger.info(f"bits: {bits}")
+        bits = bits.flatten(start_dim=-3)            # [B, tree_len, n_chunks*64]
+        tree_len = bits.size(1)
+        tree_mask = bits[..., :tree_len].bool()      # [B, tree_len, tree_len]
+
+        # ---- 2. 拼接前缀可见区 ----
+        prefix_len = src_len - tree_len
+        B = tree_mask.size(0)
+
+        # 让 **每一行** 的树 token 都能看见全部 prefix
+        prefix_vis = torch.ones(B, tree_len, prefix_len, dtype=torch.bool, device=device)
+        full_mask = torch.cat([prefix_vis, tree_mask], dim=-1)   # [B, tree_len, src_len]
+
+        return full_mask
+        
+    def _unpackbits_fallback(self, x: torch.Tensor, *, dim: int = -1) -> torch.Tensor:
+        """
+        手动实现 torch.unpackbits, 保持与 numpy 默认的 'big' bitorder 一致：
+        MSB 在前 → 对应 shift 7,6,...,0
+        支持 GPU & broadcast, 仅限 uint8。
+        """
+        if x.dtype != torch.uint8:
+            raise TypeError("fallback unpackbits expects uint8 input")
+
+        # 把目标维度挪到最后，方便向量化
+        if dim != -1 and dim != x.ndim - 1:
+            x = x.movedim(dim, -1)
+
+        shifts = torch.arange(7, -1, -1, device=x.device, dtype=torch.uint8)
+        bits = (x.unsqueeze(-1) >> shifts) & 1          # [..., 8]
+        # 现在 bits 的最后一维是 bit 列表；如果原 dim 不是最后，再挪回去
+        if dim != -1 and dim != x.ndim - 1:
+            bits = bits.movedim(-2, dim)
+
+        return bits
 
     def _reorder_cache_inplace(self, cache_tensors: torch.Tensor, hypo_ids: torch.Tensor):
         """If hypo_ids is specified, reorder elements of each cache tensor in-place by taking indices from hypo_ids"""

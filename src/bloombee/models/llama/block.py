@@ -856,12 +856,39 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
             attention_mask = torch.ones(
                 (batch_size, seq_length_with_past), dtype=torch.bool, device=hidden_states.device
             )
-        attention_mask = _prepare_4d_causal_attention_mask(
-            attention_mask=attention_mask,
-            input_shape=(batch_size, seq_length),
-            inputs_embeds=hidden_states,
-            past_key_values_length=past_key_values_length,
-        )
+            attention_mask = _prepare_4d_causal_attention_mask(
+                attention_mask=attention_mask,
+                input_shape=(batch_size, seq_length),
+                inputs_embeds=hidden_states,
+                past_key_values_length=past_key_values_length,
+            )
+        else:
+            # 新的逻辑：处理自定义的attention mask（支持speculative decoding）
+            if attention_mask.dim() == 3:
+                # 输入是3D mask: [batch_size, seq_length, total_length]
+                # 需要转换为4D mask: [batch_size, 1, seq_length, total_length]
+                attention_mask = attention_mask.unsqueeze(1)  # 添加head维度
+                
+                # 转换为合适的格式（通常需要将True/False转换为0/-inf）
+                if attention_mask.dtype == torch.bool:
+                    # True表示可以attend，False表示不能attend
+                    # 转换为additive mask：0表示可以attend，-inf表示不能attend
+                    attention_mask = attention_mask.to(dtype=hidden_states.dtype)
+                    attention_mask = (1.0 - attention_mask) * torch.finfo(hidden_states.dtype).min
+                
+            elif attention_mask.dim() == 2:
+                # 如果是2D mask，使用原来的处理方式
+                attention_mask = _prepare_4d_causal_attention_mask(
+                    attention_mask=attention_mask,
+                    input_shape=(batch_size, seq_length),
+                    inputs_embeds=hidden_states,
+                    past_key_values_length=past_key_values_length,
+                )
+            elif attention_mask.dim() == 4:
+                # 如果已经是4D mask，直接使用
+                pass
+            else:
+                raise ValueError(f"Unsupported attention_mask dimensions: {attention_mask.dim()}")
 
         outputs = super().forward( ############
             hidden_states,

@@ -186,9 +186,9 @@ async def iterate_rpc_inference(
             # TODO: kwargs currently is unused, it can be used later for peft-like adaptation
             flat_tensors, kwargs = unpack_args_kwargs(flat_tensors, args_structure)
 
-        hidden_states, prompts, hypo_ids, *_ = flat_tensors
+        hidden_states, prompts, hypo_ids, tree_mask, *_ = flat_tensors
         batch_size, length_increment, _ = hidden_states.shape
-
+        print(f"server receives tree_mask: {tree_mask}")
         # Cast inputs to backend dtype
         hidden_states = hidden_states.to(requested_backends[0].dtype)
         assert hypo_ids.dtype == torch.int64, f"hypo ids must be int64, got {hypo_ids.dtype}"
@@ -234,7 +234,7 @@ async def iterate_rpc_inference(
                 print('-=-=-=-=-=-=-=-==-=- come into can merge pools : ', can_merge_pools)
                 
                 inference_infos = tuple(
-                    InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter)
+                    InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter, tree_attention_mask=tree_mask)
                     for uid, handles in zip(requested_uids, cache_handles)
                 )
                 (hidden_states,) = await requested_backends[0].inference_pool.submit_task(
@@ -244,7 +244,7 @@ async def iterate_rpc_inference(
             else:
                 print('-=-=-=-=-=-=-=-==-=- not come into can merge pools : ', can_merge_pools)
                 for backend, uid, handles, prompt in zip(requested_backends, requested_uids, cache_handles, prompts):
-                    inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter),)
+                    inference_infos = (InferenceMetadata(uid, prefix_length, tuple(handles), active_adapter, tree_attention_mask=tree_mask),)
                     (hidden_states,) = await backend.inference_pool.submit_task(
                         hidden_states, hypo_ids, inference_infos, prompt, priority=priority
                     )

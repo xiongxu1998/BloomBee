@@ -99,6 +99,7 @@ class _ServerInferenceSession:
         inputs: torch.Tensor,
         prompts: torch.Tensor,
         hypo_ids: torch.LongTensor,
+        tree_attention_mask: Optional[torch.Tensor] = None,
         *,
         step_id: str,
     ) -> torch.Tensor:
@@ -127,7 +128,7 @@ class _ServerInferenceSession:
             inputs = inputs[:, -n_input_tokens:]  # No need to pass prefix further
 
         # serialize inputs and put them into the queue
-        input_tensors, args_structure = pack_args_kwargs(inputs, prompts, hypo_ids)
+        input_tensors, args_structure = pack_args_kwargs(inputs, prompts, hypo_ids, tree_attention_mask)
         logger.info(f"client inference session step() input_tensors after packing: {input_tensors}")
         logger.info(f"client inference session step() input_tensors after packing shape: {input_tensors[0].shape}")
         logger.info(f"_ServerInferenceSession  step id: {step_id}")
@@ -143,6 +144,7 @@ class _ServerInferenceSession:
                 request_metadata["next_servers"] = next_servers
 
         request_metadata["args_structure"] = args_structure
+        logger.info(f"request_metadata: {request_metadata}")
 
         # TODO: make possible to use different compression method for different tensors
         server_side_inference_schema, kwargs_schema = self.rpc_info["inference_schema"]
@@ -291,6 +293,7 @@ class InferenceSession:
         inputs: torch.Tensor,
         prompts: Optional[torch.Tensor] = None,
         hypo_ids: Optional[torch.Tensor] = None,
+        tree_attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert not self._closed
         if torch.is_grad_enabled():
@@ -316,22 +319,24 @@ class InferenceSession:
         inputs = inputs.cpu()
         prompts = prompts.cpu()
         hypo_ids = hypo_ids.cpu()
+        tree_attention_mask = tree_attention_mask.cpu()
         step_id = str(uuid.uuid4()) #生成一个唯一的步骤 ID。
 
         n_input_tokens = inputs.shape[1]
-        print(f"=== Step Debug Info ===")
-        print(f"step_id: {step_id}")
-        print(f"self._position: {self._position}")
-        print(f"n_input_tokens: {n_input_tokens}")
-        print(f"self._max_length: {self._max_length}")
-        print(f"self._position + n_input_tokens: {self._position + n_input_tokens}")
-        print(f"Will exceed limit? {self._position + n_input_tokens > self._max_length}")
-        print(f"inputs.shape: {inputs.shape}")
+        logger.info(f"=== Step Debug Info ===")
+        logger.info(f"step_id: {step_id}")
+        logger.info(f"self._position: {self._position}")
+        logger.info(f"n_input_tokens: {n_input_tokens}")
+        logger.info(f"self._max_length: {self._max_length}")
+        logger.info(f"self._position + n_input_tokens: {self._position + n_input_tokens}")
+        logger.info(f"Will exceed limit? {self._position + n_input_tokens > self._max_length}")
+        logger.info(f"inputs.shape: {inputs.shape}")
         if hasattr(self, 'history') and self.history is not None:
-            print(f"self.history.shape: {self.history.shape}")
+            logger.info(f"self.history.shape: {self.history.shape}")
         else:
-            print(f"self.history: None")
-        print(f"=======================")
+            logger.info(f"self.history: None")
+        logger.info(f"tree_attention_mask: {tree_attention_mask}")
+        logger.info(f"=======================")
         if self._position + n_input_tokens > self._max_length:
             raise ValueError(
                 f"Maximum length exceeded: prefix {self._position} + current {n_input_tokens} exceeds pre-allocated maximum {self._max_length}"
@@ -353,6 +358,7 @@ class InferenceSession:
                         inputs,
                         prompts[server_session.span.start : server_session.span.end],
                         hypo_ids,
+                        tree_attention_mask,
                         step_id=step_id,
                     )
                     # print('inputs ', inputs)
