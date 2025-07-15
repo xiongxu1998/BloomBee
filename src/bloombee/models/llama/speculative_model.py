@@ -97,6 +97,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         step_idx = 0
         current_input_ids = input_ids
         
+        
         while not finished and current_input_ids.shape[1] < input_ids.shape[1] + max_new_tokens:
             logger.info(f"\n==================== STEP {step_idx} ====================")
             logger.info(f"[DEBUG] Current sequence length: {current_input_ids.shape[1]}")
@@ -108,7 +109,7 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             )
             
             # 2. Verify trees using distributed inference - but through forward() call
-            verified_tokens, past_key_values = self._verify_trees_with_forward(
+            verified_tokens, verified_tokens_positions, past_key_values = self._verify_trees_with_forward(
                 input_ids=current_input_ids,
                 trees=spec_trees,
                 logits_processor=logits_processor,
@@ -117,6 +118,8 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 use_kv_cache=use_kv_cache,
                 kv_cache_window=kv_cache_window
             )
+            
+            past_key_values.set_kv_cache(verified_tokens_positions)
             
             is_first_iteration = False
             
@@ -243,11 +246,11 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 logger.info(f"[DEBUG] Subsequent iteration completed, session position: {active_session.position}")
         
         # Extract verification results
-        verified_tokens = self._extract_best_verified_paths_fixed(
+        verified_tokens, verified_tokens_positions = self._extract_best_verified_paths_fixed(
             logits, batch_node_paths, input_ids, logits_processor
         )
         logger.info(f"[DEBUG] Verified tokens (per batch): {verified_tokens.tolist()}")
-        return verified_tokens, new_past_key_values
+        return verified_tokens, verified_tokens_positions, new_past_key_values
     
     def pack_bool_mask_to_int64(self, mask_bool: torch.Tensor) -> torch.Tensor:
         packed = np.packbits(mask_bool.cpu().numpy().astype(np.uint8), axis=-1)
@@ -403,20 +406,24 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
         batch_node_paths: List[List[List[TreeNode]]],
         input_ids: torch.LongTensor,
         logits_processor: LogitsProcessorList
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Extract best verified paths with proper error handling
+        Returns: (verified_tokens, verified_tokens_positions)
         """
         batch_size = logits.shape[0]
         batch_verified = []
+        batch_positions = []
         
         for batch_idx in range(batch_size):
             node_paths = batch_node_paths[batch_idx]
             best_verified = []
+            best_positions = []
             best_score = -1
             
             for node_path in node_paths:
                 verified_tokens = []
+                verified_positions = []
                 
                 for node in node_path:
                     pos = node.position_in_sequence
@@ -427,14 +434,22 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                     
                     if predicted_token == node.token_id:
                         verified_tokens.append(node.token_id)
+                        # 计算在整个序列中的绝对位置
+                        # 根节点位置 = input_ids.shape[1] - 1 (输入序列的最后一个位置)
+                        # 树中节点的绝对位置 = 根节点位置 + 节点在树中的深度 + 1
+                        root_position = input_ids.shape[1] - 1
+                        absolute_position = root_position + node.depth + 1
+                        verified_positions.append(absolute_position)
                     else:
                         break
                 
                 if len(verified_tokens) > best_score:
                     best_score = len(verified_tokens)
                     best_verified = verified_tokens
+                    best_positions = verified_positions
             
             batch_verified.append(best_verified)
+            batch_positions.append(best_positions)
         
         # Handle empty verification case
         best_len = max((len(v) for v in batch_verified), default=0)
@@ -446,23 +461,50 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
             for processor in logits_processor:
                 processed_logits = processor(input_ids, processed_logits)
             next_token = torch.argmax(processed_logits, dim=-1, keepdim=True)
-            return next_token
+            
+            # 生成单个token的位置
+            next_token_positions = []
+            for batch_idx in range(batch_size):
+                # 下一个token的位置应该是当前输入序列长度
+                next_pos = input_ids.shape[1]
+                next_token_positions.append([next_pos])
+            
+            next_positions_tensor = torch.tensor(next_token_positions, device=logits.device)
+            return next_token, next_positions_tensor
         
-        # Pad to same length
+        # Pad verified tokens to same length
         padded_verified = []
-        for verified in batch_verified:
-            padded = verified + [0] * (best_len - len(verified))
-            padded_verified.append(padded)
+        padded_positions = []
+        for verified, positions in zip(batch_verified, batch_positions):
+            padded_v = verified + [0] * (best_len - len(verified))
+            padded_p = positions + [0] * (best_len - len(positions))  # 用0填充位置
+            padded_verified.append(padded_v)
+            padded_positions.append(padded_p)
         
         verified_tensor = torch.tensor(padded_verified, device=logits.device)
+        positions_tensor = torch.tensor(padded_positions, device=logits.device)
         
         # Generate additional token using logits processor
         if verified_tensor.shape[1] > 0:
             # Use the position after last verified token
             final_positions = []
-            for v in batch_verified:
-                pos = len(v) if len(v) < logits.shape[1] else logits.shape[1] - 1
+            next_token_positions = []
+            
+            for batch_idx, (verified, positions) in enumerate(zip(batch_verified, batch_positions)):
+                if len(verified) < logits.shape[1]:
+                    pos = len(verified)
+                else:
+                    pos = logits.shape[1] - 1
                 final_positions.append(pos)
+                
+                # 计算下一个token的绝对位置
+                if len(positions) > 0:
+                    # 基于最后一个验证token的位置
+                    next_pos = positions[-1] + 1
+                else:
+                    # 如果没有验证的token，则从当前输入序列的末尾开始
+                    next_pos = input_ids.shape[1]
+                next_token_positions.append(next_pos)
             
             final_logits = torch.stack([
                 logits[i, pos] for i, pos in enumerate(final_positions)
@@ -475,6 +517,10 @@ class DistributedLlamaForSpeculativeGeneration(DistributedLlamaForCausalLM):
                 processed_logits = processor(processor_input, processed_logits)
             
             next_token = torch.argmax(processed_logits, dim=-1, keepdim=True)
+            next_positions = torch.tensor([[pos] for pos in next_token_positions], device=logits.device)
+            
+            # 合并verified tokens和新生成的token
             verified_tensor = torch.cat([verified_tensor, next_token], dim=1)
+            positions_tensor = torch.cat([positions_tensor, next_positions], dim=1)
         
-        return verified_tensor
+        return verified_tensor, positions_tensor

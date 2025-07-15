@@ -117,3 +117,4 @@ class InferenceMetadata:
     cache_handles: Tuple[Handle, ...]
     active_adapter: Optional[str]
     tree_attention_mask: Optional[torch.Tensor] = None
+    kv_cache_position_ids: Optional[torch.Tensor] = None

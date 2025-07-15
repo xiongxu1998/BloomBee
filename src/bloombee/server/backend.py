@@ -191,23 +191,25 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             # reserved in `Server._choose_num_blocks()`. This saves us from OOMs if `max_chunk_size_bytes`
             # is at least 4-6x less than `autograd_memory`.
             max_chunk_length = self._estimate_max_chunk_length(hidden_states, inference_info) # 估计最大分块长度 
-            print("transformer backend inference step() : max_chunk_length", max_chunk_length)
+            logger.info(f"transformer backend inference step() : max_chunk_length: {max_chunk_length}")
             see_memory_usage("transformer backend inference step : seq_len")
             output_hidden_states = torch.empty_like(hidden_states) if seq_len > max_chunk_length else None # 初始化输出状态
             # print("transformer backend inference step : output_hidden_states", output_hidden_states) # output_hidden_states:None
-            layer_past = self._select_layer_past(cache_tensors, inference_info.prefix_length) # 选择上一个层的缓存状态
+            layer_past = self._select_layer_past(cache_tensors, inference_info.prefix_length - seq_len, inference_info.kv_cache_position_ids) # 选择上一个层的缓存状态   
+            
             logger.info(f"tree_attention_mask: {inference_info.tree_attention_mask}, prefix_length: {inference_info.prefix_length}, seq_len: {seq_len}")
+            logger.info(f"kv_cache_position_ids: {inference_info.kv_cache_position_ids}")
             full_mask = self._create_attention_mask(
                 tree_attention_mask=inference_info.tree_attention_mask,
-                src_len=inference_info.prefix_length + seq_len,
+                src_len=inference_info.prefix_length,
                 device=hidden_states.device,
             )
             logger.info(f"tree_attention_mask full_mask: {full_mask}")
             for offset in range(0, seq_len, max_chunk_length): # 遍历序列以按块处理隐藏状态   only run offset=0
                 hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :] # 获取当前的隐藏状态块 
                 chunk_len = min(max_chunk_length, seq_len - offset)
-                print('transformer backend inference step() offset ', offset )
-                print('transformer backend inference step() offset + max_chunk_length',  (offset + max_chunk_length))
+                logger.info(f"transformer backend inference step() offset {offset}")
+                logger.info(f"transformer backend inference step() offset + max_chunk_length: {(offset + max_chunk_length)}")
                 # output_hidden_states_chunk, new_kvs = self.module.forward(
                 #     hidden_states_chunk, layer_past=layer_past, use_cache=True # 前向传播，返回新的键值状态  
                 # )
@@ -303,15 +305,137 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             for cache_tensor in cache_tensors:
                 cache_tensor[...] = cache_tensor[hypo_ids.to(cache_tensor.device)]  # in-place reorder cache by hypo ids
 
-    def _select_layer_past(self, cache_tensors: Sequence[torch.Tensor], prefix_length: int) -> Sequence[torch.Tensor]:
-        """Extract first {prefix_length} tokens and reshape them such that they can be used as layer_past"""
+    # def _select_layer_past(self, cache_tensors: Sequence[torch.Tensor], prefix_length: int) -> Sequence[torch.Tensor]:
+    #     """Extract first {prefix_length} tokens and reshape them such that they can be used as layer_past"""
+    #     key_cache, value_cache = list(cache_tensors[0::2]), list(cache_tensors[1::2])
+    #     for i in range(len(key_cache)):
+    #         key_cache[i] = key_cache[i].flatten(0, 1)[:, :, :prefix_length]
+    #         # shape: [batch * num_kv_heads, head_dim, kv_length]
+    #         value_cache[i] = value_cache[i].flatten(0, 1)[:, :prefix_length]
+    #         # shape: [batch * num_kv_heads, kv_length, head_dim]
+            
+    #         k, v = key_cache[i], value_cache[i]          # 取出张量
+
+    #         # ── 打印裁剪前信息 ─────────────────────────────────────
+    #         sample_k = k.flatten()[0].item() if k.numel() else float('nan')
+    #         sample_v = v.flatten()[0].item() if v.numel() else float('nan')
+    #         logger.info(
+    #             f"[KV] L{i:02d} key shape {tuple(k.shape)} "
+    #             f"value shape {tuple(v.shape)} "
+    #             f"sample k={sample_k:.4g} v={sample_v:.4g}"
+    #         )
+    #     layer_past = tuple(chain(*zip(key_cache, value_cache)))
+    #     logger.info(f"cache_tensors size: {len(cache_tensors)},  ")
+    #     return PerDeviceTensors(*layer_past) if len(self.module.module_shards) > 1 else layer_past
+    
+    def _select_layer_past(self, cache_tensors: Sequence[torch.Tensor], prefix_length: int, kv_cache_position_ids: Optional[torch.Tensor] = None) -> Sequence[torch.Tensor]:
+        """Extract first {prefix_length} tokens and optionally specific positions based on kv_cache_position_ids"""
         key_cache, value_cache = list(cache_tensors[0::2]), list(cache_tensors[1::2])
+        
         for i in range(len(key_cache)):
-            key_cache[i] = key_cache[i].flatten(0, 1)[:, :, :prefix_length]
-            # shape: [batch * num_kv_heads, head_dim, kv_length]
-            value_cache[i] = value_cache[i].flatten(0, 1)[:, :prefix_length]
-            # shape: [batch * num_kv_heads, kv_length, head_dim]
+            # 首先获取原始的 key 和 value cache
+            key_cache[i] = key_cache[i].flatten(0, 1)  # [batch * num_kv_heads, head_dim, total_length]
+            value_cache[i] = value_cache[i].flatten(0, 1)  # [batch * num_kv_heads, total_length, head_dim]
+            
+            k, v = key_cache[i], value_cache[i]
+            
+            # 如果提供了 kv_cache_position_ids，需要选择特定位置的 cache
+            if kv_cache_position_ids is not None and not is_dummy(kv_cache_position_ids):
+                logger.info(f"Selecting KV cache using position_ids: {kv_cache_position_ids}")
+                
+                # kv_cache_position_ids 的形状应该是 [batch_size, num_positions] 或 [num_positions]
+                position_ids = kv_cache_position_ids.to(k.device)
+                
+                # 确保 position_ids 是 2D 的
+                if position_ids.dim() == 1:
+                    # 如果是 1D，假设 batch_size = 1
+                    position_ids = position_ids.unsqueeze(0)  # [1, num_positions]
+                
+                batch_size = position_ids.shape[0]
+                num_tree_positions = position_ids.shape[1]
+                num_kv_heads = k.shape[0] // batch_size
+                
+                # 构建完整的位置列表：前文 + 树节点
+                all_positions_list = []
+                for batch_idx in range(batch_size):
+                    batch_positions = position_ids[batch_idx]  # [num_tree_positions]
+                    
+                    # 根节点位置是第0个元素
+                    root_position = batch_positions[0].item()
+                    
+                    # 前文位置：0 到 root_position-1
+                    prefix_positions = torch.arange(0, root_position, device=position_ids.device)
+                    
+                    # 合并前文位置和树位置
+                    complete_positions = torch.cat([prefix_positions, batch_positions])
+                    all_positions_list.append(complete_positions)
+                
+                # 找到最大长度，用于填充
+                max_length = max(len(pos) for pos in all_positions_list)
+                
+                # 创建填充后的位置张量
+                padded_positions = torch.zeros(batch_size, max_length, dtype=torch.long, device=position_ids.device)
+                position_mask = torch.zeros(batch_size, max_length, dtype=torch.bool, device=position_ids.device)
+                
+                for batch_idx, positions in enumerate(all_positions_list):
+                    seq_len = len(positions)
+                    padded_positions[batch_idx, :seq_len] = positions
+                    position_mask[batch_idx, :seq_len] = True
+                
+                # 确保位置索引在有效范围内
+                padded_positions = torch.clamp(padded_positions, 0, k.shape[2] - 1)
+                
+                # 展开 position_ids 以匹配所有头
+                expanded_positions = padded_positions.repeat_interleave(num_kv_heads, dim=0)  # [batch*num_kv_heads, max_length]
+                expanded_mask = position_mask.repeat_interleave(num_kv_heads, dim=0)  # [batch*num_kv_heads, max_length]
+                
+                # 使用 gather 操作选择对应位置的 cache
+                # key cache: 在第2维(seq_len维)上选择
+                selected_key = torch.gather(k, 2, expanded_positions.unsqueeze(1).expand(-1, k.shape[1], -1))
+                
+                # value cache: 在第1维(seq_len维)上选择  
+                selected_value = torch.gather(v, 1, expanded_positions.unsqueeze(2).expand(-1, -1, v.shape[2]))
+                
+                # 应用mask，将无效位置设为0（虽然通常不会被使用）
+                if expanded_mask.any():
+                    mask_key = expanded_mask.unsqueeze(1).expand(-1, k.shape[1], -1)
+                    mask_value = expanded_mask.unsqueeze(2).expand(-1, -1, v.shape[2])
+                    selected_key = selected_key * mask_key.float()
+                    selected_value = selected_value * mask_value.float()
+                
+                key_cache[i] = selected_key
+                value_cache[i] = selected_value
+                
+                logger.info(
+                    f"[KV] L{i:02d} selected key shape {tuple(selected_key.shape)} "
+                    f"value shape {tuple(selected_value.shape)} "
+                    f"root_positions: {[pos[0].item() for pos in all_positions_list]} "
+                    f"total_positions: {[len(pos) for pos in all_positions_list]}"
+                )
+            else:
+                # 原有逻辑：只选择前 prefix_length 个 tokens
+                key_cache[i] = k[:, :, :prefix_length]
+                value_cache[i] = v[:, :prefix_length, :]
+                
+                logger.info(
+                    f"[KV] L{i:02d} prefix key shape {tuple(key_cache[i].shape)} "
+                    f"value shape {tuple(value_cache[i].shape)} "
+                    f"prefix_length={prefix_length}"
+                )
+            
+            # 打印调试信息
+            k, v = key_cache[i], value_cache[i]
+            sample_k = k.flatten()[0].item() if k.numel() else float('nan')
+            sample_v = v.flatten()[0].item() if v.numel() else float('nan')
+            logger.info(
+                f"[KV] L{i:02d} final key shape {tuple(k.shape)} "
+                f"value shape {tuple(v.shape)} "
+                f"sample k={sample_k:.4g} v={sample_v:.4g}"
+            )
+        
         layer_past = tuple(chain(*zip(key_cache, value_cache)))
+        logger.info(f"cache_tensors size: {len(cache_tensors)}, selected layer_past size: {len(layer_past)}")
+        
         return PerDeviceTensors(*layer_past) if len(self.module.module_shards) > 1 else layer_past
 
     def _update_cache_inplace(

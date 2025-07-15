@@ -100,6 +100,7 @@ class _ServerInferenceSession:
         prompts: torch.Tensor,
         hypo_ids: torch.LongTensor,
         tree_attention_mask: Optional[torch.Tensor] = None,
+        kv_cache_position_ids: Optional[torch.Tensor] = None,
         *,
         step_id: str,
     ) -> torch.Tensor:
@@ -128,7 +129,7 @@ class _ServerInferenceSession:
             inputs = inputs[:, -n_input_tokens:]  # No need to pass prefix further
 
         # serialize inputs and put them into the queue
-        input_tensors, args_structure = pack_args_kwargs(inputs, prompts, hypo_ids, tree_attention_mask)
+        input_tensors, args_structure = pack_args_kwargs(inputs, prompts, hypo_ids, tree_attention_mask, kv_cache_position_ids)
         logger.info(f"client inference session step() input_tensors after packing: {input_tensors}")
         logger.info(f"client inference session step() input_tensors after packing shape: {input_tensors[0].shape}")
         logger.info(f"_ServerInferenceSession  step id: {step_id}")
@@ -294,6 +295,7 @@ class InferenceSession:
         prompts: Optional[torch.Tensor] = None,
         hypo_ids: Optional[torch.Tensor] = None,
         tree_attention_mask: Optional[torch.Tensor] = None,
+        kv_cache_position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert not self._closed
         if torch.is_grad_enabled():
@@ -320,6 +322,7 @@ class InferenceSession:
         prompts = prompts.cpu()
         hypo_ids = hypo_ids.cpu()
         tree_attention_mask = tree_attention_mask.cpu()
+        kv_cache_position_ids = kv_cache_position_ids.cpu()
         step_id = str(uuid.uuid4()) #生成一个唯一的步骤 ID。
 
         n_input_tokens = inputs.shape[1]
@@ -336,6 +339,7 @@ class InferenceSession:
         else:
             logger.info(f"self.history: None")
         logger.info(f"tree_attention_mask: {tree_attention_mask}")
+        logger.info(f"kv_cache_position_ids: {kv_cache_position_ids}")
         logger.info(f"=======================")
         if self._position + n_input_tokens > self._max_length:
             raise ValueError(
@@ -359,6 +363,7 @@ class InferenceSession:
                         prompts[server_session.span.start : server_session.span.end],
                         hypo_ids,
                         tree_attention_mask,
+                        kv_cache_position_ids,
                         step_id=step_id,
                     )
                     # print('inputs ', inputs)
