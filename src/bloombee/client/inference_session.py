@@ -322,7 +322,7 @@ class InferenceSession:
         prompts = prompts.cpu()
         hypo_ids = hypo_ids.cpu()
         tree_attention_mask = tree_attention_mask.cpu()
-        kv_cache_position_ids = kv_cache_position_ids.cpu()
+        kv_cache_position_ids = kv_cache_position_ids.cpu() if kv_cache_position_ids is not None else None
         step_id = str(uuid.uuid4()) #生成一个唯一的步骤 ID。
 
         n_input_tokens = inputs.shape[1]

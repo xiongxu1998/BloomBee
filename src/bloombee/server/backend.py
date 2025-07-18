@@ -195,13 +195,13 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             see_memory_usage("transformer backend inference step : seq_len")
             output_hidden_states = torch.empty_like(hidden_states) if seq_len > max_chunk_length else None # 初始化输出状态
             # print("transformer backend inference step : output_hidden_states", output_hidden_states) # output_hidden_states:None
-            layer_past = self._select_layer_past(cache_tensors, inference_info.prefix_length - seq_len, inference_info.kv_cache_position_ids) # 选择上一个层的缓存状态   
+            layer_past = self._select_layer_past(cache_tensors, inference_info.prefix_length, inference_info.kv_cache_position_ids) # 选择上一个层的缓存状态   
             
             logger.info(f"tree_attention_mask: {inference_info.tree_attention_mask}, prefix_length: {inference_info.prefix_length}, seq_len: {seq_len}")
             logger.info(f"kv_cache_position_ids: {inference_info.kv_cache_position_ids}")
             full_mask = self._create_attention_mask(
                 tree_attention_mask=inference_info.tree_attention_mask,
-                src_len=inference_info.prefix_length,
+                src_len=seq_len,
                 device=hidden_states.device,
             )
             logger.info(f"tree_attention_mask full_mask: {full_mask}")
