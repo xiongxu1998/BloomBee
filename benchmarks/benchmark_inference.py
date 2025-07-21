@@ -56,18 +56,25 @@ def benchmark_inference(process_idx, args, result_pipe):
     
     logger.info(f"🔍 [Process {process_idx}] BOS token id: {tokenizer.bos_token_id}")
     logger.info(f"🔍 [Process {process_idx}] Starting inference session...")
+    test_prompt = "Simply put, the theory of relativity states that"
+    result = ""
+    input_ids = tokenizer.encode(test_prompt, return_tensors="pt", add_special_tokens=True)
+    
     
     with model.transformer.h.inference_session(max_length=args.seq_len) as sess:
+        
+
         for step in range(args.seq_len):
             start_time = perf_counter()
 
             logger.info(f"🔍 [Process {process_idx}] Step {step} - Before generation:")
             logger.info(f"🔍 [Process {process_idx}] Current result length: {len(result)}")
             logger.info(f"🔍 [Process {process_idx}] Current result text: {repr(result)}")
-
-            outputs = model.generate(max_new_tokens=1, session=sess)
-            
-
+            if (step == 0):
+                outputs = model.generate(input_ids, max_new_tokens=1, session=sess)
+            else:
+                outputs = model.generate(max_new_tokens=1, session=sess)
+                
             logger.info(f"🔍 [Process {process_idx}] Step {step} - After generation:")
             logger.info(f"🔍 [Process {process_idx}] Generated outputs shape: {outputs.shape}")
             logger.info(f"🔍 [Process {process_idx}] Generated outputs: {outputs}")

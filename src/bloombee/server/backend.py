@@ -247,7 +247,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                     layer_past = new_kvs # Update cache state
 
                 # 🔧 Fixed: Restore cache update logic  
-                self._update_cache_inplace(cache_tensors, new_kvs, inference_info.prefix_length) # Update cache
+                # self._update_cache_inplace(cache_tensors, new_kvs, inference_info.prefix_length) # Update cache
                 print('backend.py output_hidden_states.shape ', output_hidden_states.shape)
                 return (output_hidden_states,) # Return output hidden states
                 
