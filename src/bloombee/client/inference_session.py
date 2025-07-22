@@ -362,7 +362,8 @@ class InferenceSession:
                     time.sleep(delay) 
 
         self._position += n_input_tokens 
-        outputs = inputs[:, -n_input_tokens:] 
+        print(f"lient inference session outputs, inputs: {inputs}")
+        outputs = inputs 
         outputs = outputs.to(device=inputs_device, dtype=inputs_dtype) 
         print('client inference session outputs ', outputs.shape)
         return outputs

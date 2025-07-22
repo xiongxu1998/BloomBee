@@ -521,7 +521,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
         for j in range(num_layers):
             for k in range(num_gpu_batches):
-                self.cache_home[j][k].clear()
+                # self.cache_home[j][k].clear()
                 self.cache_read_buf[j][k].clear()
                 self.cache_write_buf[j][k].clear()
         for j in range(num_layers):
@@ -580,7 +580,11 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
                 i = current_position  # Use the actual position instead of hardcoded 0
                 
                 for k in range(self.num_gpu_batches):
-                    self.update_attention_mask(0, k, hidden_states.shape[1])
+                    if i == 0:
+                        mask_length = hidden_states.shape[1]
+                    else:
+                        mask_length = i + 1
+                    self.update_attention_mask(0, k, mask_length)
                 
                 for j in range(self.num_layers):
                     for k in range(self.num_gpu_batches):
@@ -993,7 +997,7 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
 
 def get_test_inputs(prompt_len, num_prompts, tokenizer):
     prompts = [
-        "Simply put, the theory of relativity states that",
+        "I believe the meaning of life is",
         # "I believe the meaning of life is",
         # "",
         # """Translate English to French:

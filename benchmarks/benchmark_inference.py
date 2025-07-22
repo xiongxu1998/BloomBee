@@ -56,7 +56,8 @@ def benchmark_inference(process_idx, args, result_pipe):
     
     logger.info(f"🔍 [Process {process_idx}] BOS token id: {tokenizer.bos_token_id}")
     logger.info(f"🔍 [Process {process_idx}] Starting inference session...")
-    test_prompt = "Simply put, the theory of relativity states that"
+    # test_prompt = "Simply put, the theory of relativity states that"
+    test_prompt ="I believe the meaning of life is"
     result = ""
     input_ids = tokenizer.encode(test_prompt, return_tensors="pt", add_special_tokens=True)
     

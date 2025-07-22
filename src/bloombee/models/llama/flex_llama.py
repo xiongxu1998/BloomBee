@@ -487,7 +487,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             nan_positions = nan_mask.nonzero()[:5]  # 前5个NaN位置
             print(f"NaN positions in cache_home: {nan_positions}")
         
-        print(f"k_home: {k_home.data}, v_home: {v_home.data}")
+        # print(f"k_home: {k_home.data}, v_home: {v_home.data}")
         
 
         # Pick code path
@@ -657,6 +657,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             print(f"attention forward, mask: {mask}")
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
+            print(f"k_cache: {k_cache.shape}")
             h, new_k_cache, new_v_cache = self.compute.mha_gen_llama(
                 h, mask, w_q,
                 w_k, w_v, w_out, num_attention_heads,
