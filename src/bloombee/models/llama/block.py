@@ -400,6 +400,8 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
             else self.env.gpu)
         val = attention_compute.allocate(
             (self.policy.gpu_batch_size, mask_length), bool)
+        mask_data = np.ones((gpu_batch_size, mask_length), dtype=bool)
+        val.load_from_np(mask_data)
         # val.load_from_np((input_ids != self.config.pad_token_id)) #######
         self.attention_mask[k].store(val)
 
@@ -583,7 +585,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
                     if i == 0:
                         mask_length = hidden_states.shape[1]
                     else:
-                        mask_length = i + 1
+                        mask_length = i
                     self.update_attention_mask(0, k, mask_length)
                 
                 for j in range(self.num_layers):
@@ -997,7 +999,7 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
 
 def get_test_inputs(prompt_len, num_prompts, tokenizer):
     prompts = [
-        "I believe the meaning of life is",
+        "You've made significant progress in incorporating the KV cache into your LLaMA MHA generation function! The main issues in",
         # "I believe the meaning of life is",
         # "",
         # """Translate English to French:

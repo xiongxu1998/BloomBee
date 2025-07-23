@@ -683,121 +683,267 @@ class TorchDevice:
         ## k.shape (32,32,128)
         ## v.shape (32,32,128)
         return TorchTensor.create_from_torch(value, self), k, v
+    
+    
+    # def mha_gen_llama(
+    #     self,
+    #     inputs,
+    #     attention_mask,
+    #     w_q,
+    #     w_k,
+    #     w_v,
+    #     w_out,
+    #     n_head,
+    #     k_cache,
+    #     v_cache,
+    #     donate,
+    #     attn_sparsity,
+    #     compress_cache,
+    #     comp_config,
+    #     input_layernorm,
+    #     rotary_emb_inv_freq
+    # ):
+    #     """Multi-head attention (generation phase) with KV cache."""
 
-    def mha_gen_llama(self, h, mask, w_q, w_k, w_v, w_out, num_attention_heads,
-                k_cache, v_cache, donate, attn_sparsity,
-                compress_cache, comp_cache_config,
-                input_layernorm, rotary_emb_inv_freq):
-        """Multi-head attention (generation phase)."""
-        # Fused optimization for attention mechanism
-        b, tgt_s, hidden_size = h.shape  # tgt_s should be 1 for generation
-        head_dim = hidden_size // num_attention_heads
+    #     # Handle decompression if weights are compressed
+    #     if w_q.device.device_type == DeviceType.COMPRESSED:
+    #         w_q = w_q.device.decompress(w_q)
+    #         w_k = w_k.device.decompress(w_k)
+    #         w_v = w_v.device.decompress(w_v)
+    #         w_out = w_out.device.decompress(w_out)
+
+    #     b, tgt_s, h = inputs.shape     # Typically b=some batch, tgt_s=1 during generation
+    #     src_s = attention_mask.shape[1]
+    #     head_dim = h // n_head
+        
+    #     print(f"Debug - inputs.shape: {inputs.shape}")
+    #     print(f"Debug - attention_mask.shape: {attention_mask.shape}")
+    #     print(f"Debug - src_s: {src_s}")
+    #     print(f"Debug - k_cache: {k_cache.shape}")
+
+    #     # ---------------
+    #     # Precompute rotary
+    #     # ---------------
+    #     freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data)
+
+    #     # ---------------
+    #     # RMSNorm / LN
+    #     # ---------------
+    #     hidden = rms_norm(inputs.data, input_layernorm.data)
+
+    #     # ---------------
+    #     # Project Q/K/V (without manual scaling)
+    #     # ---------------
+    #     q = F.linear(hidden, w_q.data)       # (b, tgt_s, h)
+    #     k_new = F.linear(hidden, w_k.data)   # (b, tgt_s, h)
+    #     v_new = F.linear(hidden, w_v.data)   # (b, tgt_s, h)
+
+    #     q = q.view(b, tgt_s, n_head, head_dim)
+    #     k_new = k_new.view(b, tgt_s, n_head, head_dim)
+    #     v_new = v_new.view(b, tgt_s, n_head, head_dim)
+
+    #     # ---------------
+    #     # Rotary for new token(s)
+    #     # ---------------
+    #     q, k_new = apply_rotary_emb(
+    #         q,
+    #         k_new,
+    #         freqs_cis=freq_cis[src_s : src_s + tgt_s]
+    #     )
+
+    #     # ---------------
+    #     # Combine with old cache
+    #     # ---------------
+    #     # The new k/v is shape (b, tgt_s, n_head, head_dim).
+    #     # We store them in the big [src_s, b*n_head, head_dim] buffer typically.
+
+    #     if isinstance(k_cache, TorchTensor) and attn_sparsity >= 1.0:
+    #         if compress_cache:
+    #             # shape: (src_s, b*n_head, head_dim)
+    #             old_k = k_cache.device.decompress(k_cache)[:src_s]
+    #             old_v = v_cache.device.decompress(v_cache)[:src_s]
+    #         else:
+    #             old_k = k_cache.data[:src_s]
+    #             old_v = v_cache.data[:src_s]
+
+    #         # Insert new token at position src_s - 1
+    #         # reshape (b, tgt_s, n_head, head_dim) => (tgt_s, b*n_head, head_dim)
+    #         k_new_2d = k_new.permute(1, 0, 2, 3).reshape(tgt_s, b*n_head, head_dim)
+    #         v_new_2d = v_new.permute(1, 0, 2, 3).reshape(tgt_s, b*n_head, head_dim)
+    #         old_k[src_s - 1 : src_s] = k_new_2d
+    #         old_v[src_s - 1 : src_s] = v_new_2d
+
+    #         # Reshape for SDPA => (b, n_head, src_s, head_dim)
+    #         # old_k => (src_s, b*n_head, head_dim)
+    #         k_sdpa = old_k.permute(1, 2, 0).reshape(b, n_head, head_dim, src_s)
+    #         k_sdpa = k_sdpa.permute(0, 1, 3, 2)   # => (b, n_head, src_s, head_dim)
+
+    #         # old_v => (src_s, b*n_head, head_dim)
+    #         v_sdpa = old_v.permute(1, 0, 2).reshape(b, n_head, src_s, head_dim)
+    #     else:
+    #         # Possibly the sparse or mixed-device path
+    #         # For simplicity, we skip that here. Integrate your existing code or do a similar approach.
+    #         raise NotImplementedError("Sparse or mixed-device path with SDPA not shown.")
+
+    #     # Now Q => (b, tgt_s, n_head, head_dim) => (b, n_head, tgt_s, head_dim)
+    #     q_sdpa = q.permute(0, 2, 1, 3)  # (b, n_head, tgt_s, head_dim)
+
+    #     # ---------------
+    #     # Build attn_mask: (b, n_head, tgt_s, src_s)
+    #     # ---------------
+    #     # Suppose attention_mask.data is shape (b, src_s), with 1 => valid
+    #     # Make it boolean, then view it as (b, 1, tgt_s, src_s)
+    #     mask_4d = attention_mask.data.bool().view(b, 1, 1, src_s)
+    #     mask_4d = mask_4d.expand(b, n_head, tgt_s, src_s)
+
+    #     # ---------------
+    #     # scaled_dot_product_attention
+    #     # ---------------
+    #     attn_output = F.scaled_dot_product_attention(
+    #         q_sdpa,            # (b, n_head, tgt_s, head_dim)
+    #         k_sdpa,            # (b, n_head, src_s, head_dim)
+    #         v_sdpa,            # (b, n_head, src_s, head_dim)
+    #         attn_mask=mask_4d, # boolean mask
+    #         dropout_p=0.0,
+    #         is_causal=False,
+    #         scale=head_dim**-0.5,
+    #     )
+    #     # shape => (b, n_head, tgt_s, head_dim)
+
+    #     # ---------------
+    #     # Final projection + residual
+    #     # ---------------
+    #     value = attn_output.transpose(1, 2).reshape(b, tgt_s, h)  # (b, tgt_s, h)
+    #     value = F.linear(value, w_out.data)
+    #     value.add_(inputs.data)
+
+    #     # Cleanup
+    #     if donate[0]:
+    #         inputs.delete()
+    #     if donate[1]:
+    #         attention_mask.delete()
+
+    #     # ---------------
+    #     # Return output + newly appended (k_new, v_new)
+    #     # ---------------
+    #     # Typically you only store the “new chunk” for the cache, shaped (tgt_s, b*n_head, head_dim)
+    #     k_new_2d = k_new.permute(1, 0, 2, 3).reshape(tgt_s, b*n_head, head_dim)
+    #     v_new_2d = v_new.permute(1, 0, 2, 3).reshape(tgt_s, b*n_head, head_dim)
+
+    #     if compress_cache:
+    #         k_new_2d = self.compressed_device.compress(k_new_2d, comp_config)
+    #         v_new_2d = self.compressed_device.compress(v_new_2d, comp_config)
+    #     else:
+    #         k_new_2d = TorchTensor.create_from_torch(k_new_2d, self)
+    #         v_new_2d = TorchTensor.create_from_torch(v_new_2d, self)
+
+    #     return TorchTensor.create_from_torch(value, self), k_new_2d, v_new_2d
+    
+    
+    def mha_gen_llama(self, inputs, attention_mask, w_q, w_k, w_v,
+                w_out, n_head, k_cache, v_cache, donate,
+                attn_sparsity, compress_cache, comp_config, input_layernorm, rotary_emb_inv_freq):
+        """Multi-head attention (decoding phase)."""
+        # decompress weights
+        if w_q.device.device_type == DeviceType.COMPRESSED:
+            w_q = w_q.device.decompress(w_q)
+            w_k = w_k.device.decompress(w_k)
+            w_v = w_v.device.decompress(w_v)
+            w_out = w_out.device.decompress(w_out)
+
+        b, tgt_s, h = inputs.shape
+        src_s = attention_mask.shape[1]
+        head_dim = h // n_head
         freq_cis = precompute_freqs_cis(head_dim, 2048 * 2, rotary_emb_inv_freq.data)
         scaling = head_dim ** -0.5
 
-        # 计算当前token的Q, K, V
-        hidden = rms_norm(h.data, input_layernorm.data)
+        hidden = rms_norm(inputs.data, input_layernorm.data)
+        # hidden = F.layer_norm(inputs.data, (h,), weight=input_layernorm.data)
+
+        # shape: (b, 1, h)
         q = F.linear(hidden, w_q.data) * scaling
-        k_current = F.linear(hidden, w_k.data)
-        v_current = F.linear(hidden, w_v.data)
+        k = F.linear(hidden, w_k.data)
+        v = F.linear(hidden, w_v.data)
+        # shape: (b, 1, n_head, head_dim)
+        q = q.view(b, tgt_s, n_head, head_dim)
+        k = k.view(b, tgt_s, n_head, head_dim)
+        v = v.view(b, tgt_s, n_head, head_dim)
+        q, k = apply_rotary_emb(q, k, freqs_cis=freq_cis[src_s: src_s + tgt_s])
+         # shape: (b * n_head, 1, head_dim)
+        q = q.permute(0, 2, 1, 3).reshape(b * n_head, tgt_s, head_dim)
+        # shape: (1, b * n_head, head_dim)
+        k_new = k.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
+        # shape: (1, b * n_head, head_dim)
+        v_new = v.permute(1, 0, 2, 3).reshape(tgt_s, b * n_head, head_dim)
+        if isinstance(k_cache, TorchTensor):
+            if attn_sparsity >= 1.0:  # Dense attention
+                if compress_cache:
+                    # shape: (s, b * n_head, head_dim)
+                    k = k_cache.device.decompress(k_cache)[:src_s]
+                    v = v_cache.device.decompress(v_cache)[:src_s]
+                else:
+                    # shape: (s, b * n_head, head_dim)
+                    k = k_cache.data[:src_s]
+                    v = v_cache.data[:src_s]
+                k[src_s - 1:src_s] = k_new
+                v[src_s - 1:src_s] = v_new
+                # shape: (b * n_head, head_dim, s)
+                k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
+                # shape: (b * n_head, s, head_dim)
+                v = v.permute(1, 0, 2).reshape(b * n_head, src_s, head_dim)
+                if k.is_cuda:
+                    value = self._attention_value(q, k, v, attention_mask.data,
+                        b, src_s, tgt_s, n_head, head_dim)
+                else:
+                    q = q.float().cpu()
+                    k, v = k.float(), v.float()
+                    value = self._attention_value(q, k, v, attention_mask.data,
+                        b, src_s, tgt_s, n_head, head_dim).cuda().half()
+                        
+            else:  # Sparse attention
+                # shape: (s, b * n_head, head_dim)
+                k = k_cache.data[:src_s]
+                k[src_s - 1:src_s] = k_new
+                # shape: (b * n_head, head_dim, s)
+                k = k.permute(1, 2, 0).reshape(b * n_head, head_dim, src_s)
 
-        # 重塑为多头格式
-        q = q.view(b, tgt_s, num_attention_heads, head_dim)
-        k_current = k_current.view(b, tgt_s, num_attention_heads, head_dim)
-        v_current = v_current.view(b, tgt_s, num_attention_heads, head_dim)
+                if k.is_cuda:
+                    value = self._sparse_attention_value(q, k, v_new, v_cache,
+                        attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
+                        attn_sparsity)
+                else:
+                    q = q.float().cpu()
+                    value = self._sparse_attention_value(q, k, v_new, v_cache,
+                        attention_mask.data, b, src_s, tgt_s, n_head, head_dim,
+                        attn_sparsity).cuda().half()
+        else:  # Mixed device attention
+            assert attn_sparsity >= 1.0
+            value = self._mixed_device_attention(q, k_cache, v_cache,
+                k_new, v_new, attention_mask.data, b, src_s, tgt_s,
+                n_head, head_dim)
 
-        # 应用rotary embedding到当前token
-        
-
-        # 🔧 关键修复：拼接历史cache和当前K, V
-        if k_cache is not None and v_cache is not None:
-            # 获取历史cache数据
-            k_cache_data = k_cache.data if hasattr(k_cache, 'data') else k_cache
-            v_cache_data = v_cache.data if hasattr(v_cache, 'data') else v_cache
-            
-            
-            cache_len = k_cache_data.shape[0]
-            offset = cache_len
-            q, k_current = apply_rotary_emb(q, k_current, freqs_cis=freq_cis[offset : offset+tgt_s])
-            # 历史cache形状: (cache_len, b * num_attention_heads, head_dim)
-            # 需要重塑为: (b, cache_len, num_attention_heads, head_dim)
-            
-            k_history = k_cache_data.view(cache_len, b, num_attention_heads, head_dim).permute(1, 0, 2, 3)
-            v_history = v_cache_data.view(cache_len, b, num_attention_heads, head_dim).permute(1, 0, 2, 3)
-            
-            # 拼接：历史 + 当前
-            k_full = torch.cat([k_history, k_current], dim=1)  # (b, cache_len + 1, num_heads, head_dim)
-            v_full = torch.cat([v_history, v_current], dim=1)
-            
-            total_seq_len = cache_len + tgt_s
-            print(f"🔧 Using cache: history_len={cache_len}, current_len={tgt_s}, total_len={total_seq_len}")
-        else:
-            # 没有cache（prefill情况）
-            cache_len = 0
-            q, k_current = apply_rotary_emb(q, k_current, freqs_cis=freq_cis[:tgt_s])
-            
-            k_full = k_current
-            v_full = v_current
-            total_seq_len = tgt_s
-            print(f"🔧 No cache: using current only, total_len={total_seq_len}")
-
-        # 重塑为attention计算格式
-        # Q: (b * num_attention_heads, tgt_s, head_dim) - 只有当前token
-        q = q.permute(0, 2, 1, 3).reshape(b * num_attention_heads, tgt_s, head_dim)
-        
-        # K: (b * num_attention_heads, head_dim, total_seq_len) - 历史+当前
-        k_full = k_full.permute(0, 2, 3, 1).reshape(b * num_attention_heads, head_dim, total_seq_len)
-        
-        # V: (b * num_attention_heads, total_seq_len, head_dim) - 历史+当前
-        v_full = v_full.permute(0, 2, 1, 3).reshape(b * num_attention_heads, total_seq_len, head_dim)
-
-        # 🔧 修正attention计算
-        attn_weights = torch.bmm(q, k_full)  # (b * heads, tgt_s, total_seq_len)
-        
-        # # 🔧 修正mask处理
-        # # mask应该是 (b, total_seq_len)，需要适配到 (b, 1, tgt_s, total_seq_len)
-        # if mask.data.shape[-1] != total_seq_len:
-        #     print(f"❌ Mask length mismatch: mask={mask.data.shape[-1]}, expected={total_seq_len}")
-        
-        # if mask.size(-1) == cache_len:  # 只含历史
-        #     mask = torch.cat([mask, mask.new_ones(b, 1)], dim=-1)
-        
-        # 创建causal mask (当前token可以看到所有历史+自己)
-        # 对于generation，当前token(位置在最后)可以看到所有之前的token
-        causal_mask = torch.ones(tgt_s, total_seq_len, dtype=torch.bool, device=self.dev)
-        
-        # 应用mask
-        mask_expanded = mask.data.view(b, 1, 1, total_seq_len) & causal_mask.view(1, 1, tgt_s, total_seq_len)
-        
-        attn_weights = attn_weights.view(b, num_attention_heads, tgt_s, total_seq_len)
-        attn_weights = torch.where(mask_expanded, attn_weights, -1e4)
-        attn_weights = attn_weights.view(b * num_attention_heads, tgt_s, total_seq_len)
-        attn_weights = F.softmax(attn_weights, dim=2)
-        
-        # 计算attention输出
-        value = torch.bmm(attn_weights, v_full).view(b, num_attention_heads, tgt_s, head_dim)
-        value = value.transpose(1, 2).reshape(b, tgt_s, hidden_size)
+        # shape: (b, 1, h)
+        value = value.transpose(1, 2).view(b, tgt_s, h)
         value = F.linear(value, w_out.data)
+
+        value.add_(inputs.data)
+
+        if donate[0]: inputs.delete()
+        if donate[1]: attention_mask.delete()
         
-        # 残差连接
-        value.add_(h.data)
-
-        if donate[0]: h.delete()
-        if donate[1]: mask.delete()
-
-        # 🔧 返回当前token的K, V用于更新cache
-        # 注意：只返回当前token的K, V，不是全部的
-        k_new = k_current.permute(1, 0, 2, 3).reshape(tgt_s, b * num_attention_heads, head_dim)
-        v_new = v_current.permute(1, 0, 2, 3).reshape(tgt_s, b * num_attention_heads, head_dim)
-
         if compress_cache:
-            k_new = self.compressed_device.compress(k_new, comp_cache_config)
-            v_new = self.compressed_device.compress(v_new, comp_cache_config)
+            if comp_config.group_dim == 0:
+                s_ = src_s // comp_config.group_size * comp_config.group_size
+                k_new = k[:, :, s_:].permute(2, 0, 1)
+                v_new = v[:, s_:, :].permute(1, 0, 2)
+            k_new = self.compressed_device.compress(k_new, comp_config)
+            v_new = self.compressed_device.compress(v_new, comp_config)
         else:
             k_new = TorchTensor.create_from_torch(k_new, self)
             v_new = TorchTensor.create_from_torch(v_new, self)
 
         return TorchTensor.create_from_torch(value, self), k_new, v_new
+
 
     def _attention_weights(self, q, k, mask, b, src_s, n_head):
         # shape: (b * n_head, 1, s)

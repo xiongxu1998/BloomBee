@@ -644,9 +644,9 @@ class FLEX_LlamaAttention(LlamaAttention):
             # prefill
             # import pdb;pdb.set_trace()---------------------
             # see_memory_usage("-----------------------------------------before mha_llama ")
-            print(f"attention forward, attention_mask: {attention_mask}")
+            print(f"attention forward, attention_mask: {attention_mask.val}")
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
-            print(f"attention forward, mask: {mask}")
+            print(f"attention forward, mask: {mask.data}")
             h, new_k_cache, new_v_cache = self.compute.mha_llama(h, mask, w_q, w_k, w_v, w_out,
                                        num_attention_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config, input_layernorm, rotary_emb_inv_freq)
             cache_write_buf.store((new_k_cache, new_v_cache))
@@ -655,7 +655,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             # decoding
             # see_memory_usage("-----------------------------------------before mha_gen_llama ")
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
-            print(f"attention forward, mask: {mask}")
+            print(f"attention forward, mask: {mask.data}")
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
             print(f"k_cache: {k_cache.shape}")
             h, new_k_cache, new_v_cache = self.compute.mha_gen_llama(
