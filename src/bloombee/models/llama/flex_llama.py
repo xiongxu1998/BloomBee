@@ -669,7 +669,7 @@ class FLEX_LlamaAttention(LlamaAttention):
             cache_write_buf.store((new_k_cache, new_v_cache))
             # see_memory_usage("-----------------------------------------after mha_gen_llama ")
         hidden.val = h
-        
+        self.temp_hidden_states.val=h
         return h
 
 class FLEX_LlamaMLP(LlamaMLP):

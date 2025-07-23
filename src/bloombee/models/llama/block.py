@@ -557,8 +557,8 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
             for j in range(num_layers):
                 for k in range(num_gpu_batches):
                     self.init_cache(j, k)
-            if self.policy.cpu_cache_compute:
-                self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
+        if self.policy.cpu_cache_compute:
+            self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
         
         # Fix hardcoding: Use configuration instead of hardcoding
         # debug_mode = None #######
@@ -704,11 +704,11 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
     #######################################################################################
     def load_weight(self, i, j, k, overlap=True):
         # Handle corner cases
-        if j == self.num_layers:
-            j = 0
-            i += 1
-            if i == self.execute_gen_len:
-                return
+        # if j == self.num_layers:
+        #     j = 0
+        #     i += 1
+        #     if i == self.execute_gen_len:
+        #         return
         # Load from weight_home to weight_read_buf
         if overlap:
             with torch.cuda.stream(self.load_weight_stream):
@@ -732,14 +732,14 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         # Handle corner cases
         if i == 0:  # prefill, no cache
             return
-        if k == self.num_gpu_batches:
-            k = 0
-            j += 1
-        if j == self.num_layers:
-            j = 0
-            i += 1
-            if i == self.execute_gen_len:
-                return
+        # if k == self.num_gpu_batches:
+        #     k = 0
+        #     j += 1
+        # if j == self.num_layers:
+        #     j = 0
+        #     i += 1
+        #     if i == self.execute_gen_len:
+        #         return
         # Load from cache_home to cache_read_buf
         if overlap:
             with torch.cuda.stream(self.load_cache_stream):
