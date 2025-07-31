@@ -403,6 +403,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         mask_data = np.ones((gpu_batch_size, mask_length), dtype=bool)
         val.load_from_np(mask_data)
         # val.load_from_np((input_ids != self.config.pad_token_id)) #######
+        print(f"update_attention_mask, mask_length: {mask_length}, val: {val}")
         self.attention_mask[k].store(val)
 
     def forward(
@@ -601,17 +602,37 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
                     # 当前批次依次通过所有层
                     for j in range(self.num_layers):
                         # 加载当前层的缓存
-                        self.load_cache(i, j, k, overlap=False)
+                        # self.load_cache(i, j, k, overlap=False)
                         # self.load_hidden(i, j, k)
-                        
+                        if j == 0:
+                            past_key, past_value = past_key_value
+                            print(f"forward, past_key: {past_key}, past_value: {past_value}")
+                            b, h, s, d = past_key.shape
+
+                            # 转换成 (s, b * h, d)
+                            past_k_new = past_key.permute(2, 0, 1, 3).contiguous().view(s, b * h, d)
+                            past_v_new = past_value.permute(2, 0, 1, 3).contiguous().view(s, b * h, d)
+                            
+                            self.cache_read_buf[0][0].store((past_k_new, past_v_new))
                         # 计算当前层
                         # j=0: 使用初始hidden_states
                         # j=1: 使用temp_hidden (第0层的输出)
                         layer_output = self.compute_layer(i, j, k, position_ids=position_ids, generated_tokens_num=generated_tokens_num)
                         
+                        if j == 0:
+                            k_new, v_new = self.cache_write_buf[0][0].pop()
+                            k_new_tensor = k_new.data
+                            v_new_tensor = v_new.data
+                            key = k_new_tensor.permute(1, 2, 0)  # → (b * h, d, s)
+                            value = v_new_tensor.permute(1, 0, 2)  # → (b * h, s, d)
+                            print(f"decoder, k_new: {key}, v_new: {value}, k_new.shape: {key.shape}")
+                            past_key_value = (key, value)
+                            
+                            self.cache_write_buf[0][0].store((k_new, v_new))
+                        
                         # 存储当前层的缓存
-                        self.store_cache(i, j, k, overlap=False)
-                        torch.cuda.synchronize()
+                        # self.store_cache(i, j, k, overlap=False)
+                        # torch.cuda.synchronize()
                         # self.store_hidden(i, j, k)
                     
                     # 保存当前批次的最终输出（经过所有层）
@@ -678,6 +699,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         else:
             hidden_states = torch.cat(final_outputs, dim=0)
         print(f"final hidden_states: {hidden_states}")
+        
         outputs = (hidden_states, past_key_value)
         # self.temp_hidden.store(outputs) 
         # if output_attentions:
@@ -938,7 +960,7 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
             print(f'🔧 WrappedLlamaBlock.forward: position_ids shape={position_ids.shape}, content={position_ids}')
 
         # embed positions
-        print(f"WrappedLlamaBlock, hidden_states: {hidden_states}, seq_length: {seq_length}")
+        print(f"WrappedLlamaBlock, hidden_states: {hidden_states}, seq_length: {seq_length}, past_key_value: {past_key_value}")
         if attention_mask is None:
             attention_mask = torch.ones(
                 (batch_size, seq_length), dtype=torch.bool, device=hidden_states.device
@@ -963,6 +985,7 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
         )
         hidden_states, past_key_value = outputs
         print('block.py WrappedLlamaBlock forward : outputs ', hidden_states)
+        print(f"WrappedLlamaBlock.forward, past_key_value: {past_key_value}")
         print('use_cache', use_cache)
         # use_cache
         # if use_cache:
@@ -999,7 +1022,7 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
 
 def get_test_inputs(prompt_len, num_prompts, tokenizer):
     prompts = [
-        "You've made significant progress in incorporating the KV cache into your LLaMA MHA generation function! The main issues in",
+        "",
         # "I believe the meaning of life is",
         # "",
         # """Translate English to French:

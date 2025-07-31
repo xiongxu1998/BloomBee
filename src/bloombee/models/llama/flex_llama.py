@@ -14,7 +14,7 @@ import torch
 import torch.utils.checkpoint
 from bloombee.flexgen_utils.compression import CompressionConfig
 from bloombee.flexgen_utils.llama_config import LlamaConfig, get_llama_config, download_llama_weights
-from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import, general_copy, DeviceType, TorchDevice, TorchDisk, \
+from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import, general_copy, DeviceType, TorchDevice, TorchTensor, TorchDisk, \
     TorchMixedDevice
 from bloombee.flexgen_utils.utils import (GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
@@ -655,9 +655,18 @@ class FLEX_LlamaAttention(LlamaAttention):
             # decoding
             # see_memory_usage("-----------------------------------------before mha_gen_llama ")
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
-            print(f"attention forward, mask: {mask.data}")
-            (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
-            print(f"k_cache: {k_cache.shape}")
+            print(f"attention forward, mask: {mask.data}, ")
+            k_cache, v_cache = cache_read_buf.pop()
+            see_memory_usage()
+            if self.attention_compute == self.env.gpu:
+                print(f"attention_compute == gpu")
+            elif self.attention_compute == self.env.cpu:
+                print(f"attention_compute == cpu")
+            else:
+                print(f"attention_compute == {self.attention_compute}")
+            # k_cache = TorchTensor.create_from_torch(k_tensor, self.attention_compute)
+            # v_cache = TorchTensor.create_from_torch(v_tensor, self.attention_compute)
+            print(f"k_cache: {k_cache.shape}, self.policy.compress_cache: {self.policy.compress_cache}")
             h, new_k_cache, new_v_cache = self.compute.mha_gen_llama(
                 h, mask, w_q,
                 w_k, w_v, w_out, num_attention_heads,

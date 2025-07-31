@@ -244,10 +244,13 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                         output_hidden_states[:, offset : offset + max_chunk_length] = output_hidden_states_chunk # Store output
                     else:
                         output_hidden_states = output_hidden_states_chunk  # saves one memcopy # Copy memory only once
-                    layer_past = new_kvs # Update cache state
+                    # layer_past = new_kvs # Update cache state
 
                 # 🔧 Fixed: Restore cache update logic  
-                # self._update_cache_inplace(cache_tensors, new_kvs, inference_info.prefix_length) # Update cache
+                past_key_values_length = 0
+                if layer_past is not None and len(layer_past) > 0:
+                    past_key_values_length = layer_past[0].shape[2]
+                self._update_cache_inplace(cache_tensors, new_kvs, past_key_values_length) # Update cache
                 print('backend.py output_hidden_states.shape ', output_hidden_states.shape)
                 return (output_hidden_states,) # Return output hidden states
                 
@@ -287,12 +290,13 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
     ):
         """Writes new key/value tensors back into cache, works in-place"""
         _batch_size_times_num_kv_heads, head_dim, new_length = new_kvs[0].shape
+        logger.info(f"_batch_size_times_num_kv_heads: {_batch_size_times_num_kv_heads}, head_dim: {head_dim}, new_length: {new_length}")
         for cache_key, new_key in zip(cache_tensors[0::2], new_kvs[0::2]):
             new_key = new_key.view(*cache_key.shape[:3], new_length)
-            cache_key[:, :, :, prefix_length:new_length] = new_key[:, :, :, prefix_length:new_length]
+            cache_key[:, :, :, prefix_length:prefix_length+new_length] = new_key
         for cache_value, new_value in zip(cache_tensors[1::2], new_kvs[1::2]):
             new_value = new_value.view(*cache_value.shape[:2], new_length, head_dim)
-            cache_value[:, :, prefix_length:new_length, :] = new_value[:, :, prefix_length:new_length, :]
+            cache_value[:, :, prefix_length:prefix_length+new_length, :] = new_value
 
     def get_pools(self) -> Sequence[PrioritizedTaskPool]:
         return self.forward_pool, self.backward_pool, self.inference_pool

@@ -57,10 +57,10 @@ def benchmark_inference(process_idx, args, result_pipe):
     logger.info(f"🔍 [Process {process_idx}] BOS token id: {tokenizer.bos_token_id}")
     logger.info(f"🔍 [Process {process_idx}] Starting inference session...")
     # test_prompt = "Simply put, the theory of relativity states that"
-    test_prompt ="You've made significant progress in incorporating the KV cache into your LLaMA MHA generation function! The main issues in"
+    test_prompt =""
     result = ""
     input_ids = tokenizer.encode(test_prompt, return_tensors="pt", add_special_tokens=True)
-    
+    temp_result_tokens = input_ids
     
     with model.transformer.h.inference_session(max_length=args.seq_len) as sess:
         
@@ -90,14 +90,9 @@ def benchmark_inference(process_idx, args, result_pipe):
             logger.info(f"🔍 [Process {process_idx}] New token text: {repr(new_token_text)}")
             
 
-            full_decoded = tokenizer.decode(outputs[0])
-            logger.info(f"🔍 [Process {process_idx}] Full decoded text: {repr(full_decoded)}")
-            
-            result += tokenizer.decode(outputs[0])
-
-
-            logger.info(f"🔍 [Process {process_idx}] Updated result: {repr(result)}")
-            logger.info(f"🔍 [Process {process_idx}] Updated result length: {len(result)}")
+            temp_result_tokens = torch.cat([temp_result_tokens, outputs[:, -1:]], dim=1)
+            full_decoded = tokenizer.decode(temp_result_tokens[0])
+            logger.info(f"🔍 [Process {process_idx}] temp_result: {repr(full_decoded)}")
 
             if step >= args.warmup_steps:
                 step_times.append(perf_counter() - start_time)
