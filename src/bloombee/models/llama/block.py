@@ -135,6 +135,7 @@ class OptimizedLlamaAttention(FLEX_LlamaAttention):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
+        generated_tokens_num = 0,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         output_attentions= False #########
         assert not output_attentions
@@ -161,7 +162,7 @@ class OptimizedLlamaAttention(FLEX_LlamaAttention):
         # see_memory_usage("-----------------------------------------after position_ids ")
         
         # 🟢 Enhanced position_ids handling - more robust extraction
-        if position_ids.numel() == 0:
+        if position_ids.numel() == 0 or generated_tokens_num == 0:
             start_position = 0
             print('🔧 position_ids is empty, using start_position=0')
         elif position_ids.dim() == 0:  # 0-dimensional tensor (scalar)
@@ -182,10 +183,10 @@ class OptimizedLlamaAttention(FLEX_LlamaAttention):
         
         print(f'🔧 Extracted start_position: {start_position}')
         
-        super(OptimizedLlamaAttention, self).forward(hidden_states,cache_read_buf, weight_read_buf,attention_mask,cache_write_buf,start_position,k)
+        self.temp_hidden_states.val = super(OptimizedLlamaAttention, self).forward(hidden_states,cache_read_buf, weight_read_buf,attention_mask,cache_write_buf,start_position,k)
         # see_memory_usage("-----------------------------------------after OptimizedLlamaAttention forward ")
         # print('hidden_states ', hidden_states.val)
-        self.temp_hidden_states.val = hidden_states.val
+        # self.temp_hidden_states.val = hidden_states.val
         # print('self.temp_hidden_states.val ', self.temp_hidden_states.val)
         return self.temp_hidden_states.val,  None, None # petals :attn_output, None, past_key_value
         # bsz, q_len, _ = hidden_states.size()
@@ -383,9 +384,9 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
             )
         return self.post_attn_graph(hidden_states)
 
-    def update_attention_mask(self, i, k):
+    def update_attention_mask(self, gererated_tokens_num, k, mask_length):
         #  Fix: Handle case where we start with non-zero position but no existing mask
-        if i > 0:
+        if gererated_tokens_num > 0:
             mask = self.attention_mask[k]
             if mask.val is not None:
                 # Extend existing mask
@@ -394,15 +395,15 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
             # If mask.val is None, fall through to initialize it
 
         gpu_batch_size = self.policy.gpu_batch_size
-        left = k * gpu_batch_size
-        right = left + gpu_batch_size
-        # input_ids = self.output_ids[left:right, :self.task.prompt_len]#####
 
         attention_compute = (self.env.cpu if self.policy.cpu_cache_compute
             else self.env.gpu)
         val = attention_compute.allocate(
-            (self.policy.gpu_batch_size, self.task.prompt_len), bool)
+            (self.policy.gpu_batch_size, mask_length), bool)
+        mask_data = np.ones((gpu_batch_size, mask_length), dtype=bool)
+        val.load_from_np(mask_data)
         # val.load_from_np((input_ids != self.config.pad_token_id)) #######
+        print(f"update_attention_mask, mask_length: {mask_length}, val: {val}")
         self.attention_mask[k].store(val)
 
     def forward(
@@ -473,6 +474,10 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         actual_prompt_len = hidden_states.shape[1] if hidden_states.shape[1] > 0 else 1
         prompt_len, gen_len, cut_gen_len = actual_prompt_len, max_new_tokens, max_new_tokens
         
+        print(f"prompt_len: {prompt_len}")
+        print(f"gen_len: {gen_len}")
+        print(f"hidden_states: {hidden_states}")
+        
         #  Performance optimization: Only create Task on first call or when parameters change
         task_changed = (self._cached_task is None or 
                        self._cached_task.gen_len != max_new_tokens or 
@@ -519,7 +524,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         num_layers, num_gpu_batches = self.num_layers, self.policy.num_gpu_batches
         for j in range(num_layers):
             for k in range(num_gpu_batches):
-                self.cache_home[j][k].clear()
+                # self.cache_home[j][k].clear()
                 self.cache_read_buf[j][k].clear()
                 self.cache_write_buf[j][k].clear()
         for j in range(num_layers):
@@ -539,15 +544,20 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         tensor_data = TorchTensor(shape=data.shape, data=data, dtype=data.dtype, device=device) 
         # print('block.py OptimizedLlamaDecoderLayer forward(): tensor_data.shape ', tensor_data.shape)
         ### device should be TorchDevice Type instead of cuda:0 or cpu
-        self.hidden[0][0][0].store(tensor_data)  
+        self.hidden[0][0][0].store(tensor_data)
+        
+        print(f"num_gpu_batches: {self.num_gpu_batches}")
+        print(f"input batch size: {hidden_states.shape[0]}")
+        print(f"gpu_batch_size: {self.policy.gpu_batch_size}")
         
         # Init cache
         self.task = task
         self.set_task(task)
         # print('self.task ', self.task)
-        for j in range(num_layers):
-            for k in range(num_gpu_batches):
-                self.init_cache(j, k)
+        if task_changed:
+            for j in range(num_layers):
+                for k in range(num_gpu_batches):
+                    self.init_cache(j, k)
         if self.policy.cpu_cache_compute:
             self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
         
@@ -573,25 +583,75 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
                 i = current_position  # Use the actual position instead of hardcoded 0
                 
                 for k in range(self.num_gpu_batches):
-                    self.update_attention_mask(i, k)
+                    if i == 0:
+                        mask_length = hidden_states.shape[1]
+                    else:
+                        mask_length = i
+                    self.update_attention_mask(0, k, mask_length)
                 
                 for j in range(self.num_layers):
                     for k in range(self.num_gpu_batches):
                         self.load_weight(i, j, k, overlap=False)
+                
+                final_outputs = []
+                generated_tokens_num = 0
+                if position_ids is not None and position_ids.numel() > 0:
+                    generated_tokens_num = position_ids.flatten()[-1].item() - self.task.prompt_len + 1
+                for k in range(self.num_gpu_batches):
                     
-                    for k in range(self.num_gpu_batches):
-                        self.load_cache(i, j, k, overlap=False)
+                    # 当前批次依次通过所有层
+                    for j in range(self.num_layers):
+                        # 加载当前层的缓存
+                        # self.load_cache(i, j, k, overlap=False)
                         # self.load_hidden(i, j, k)
-                         
-                        #  Performance optimization: Reduce debug output, only enable when needed
-                        #  Pass the correct position_ids from the forward method parameter
-                        hidden_states = self.compute_layer(i, j, k, position_ids=position_ids).data.clone()  
-                        # self.temp_hidden.val = self.compute_layer(i, j, k).data.clone()
-                        # see_memory_usage('-----------------------------------------after compute_layer '+ str(i)+ '' + str(j)+' '+str(k))
-                        # print('self.temp_hidden ', self.temp_hidden.val.data)
-                        # import pdb; pdb.set_trace()
-                        # self.store_hidden(i, j, k)
+                        if j == 0:
+                            past_key, past_value = past_key_value
+                            print(f"forward, past_key: {past_key}, past_value: {past_value}")
+                            b, h, s, d = past_key.shape
+
+                            # 转换成 (s, b * h, d)
+                            past_k_new = past_key.permute(2, 0, 1, 3).contiguous().view(s, b * h, d)
+                            past_v_new = past_value.permute(2, 0, 1, 3).contiguous().view(s, b * h, d)
+                            
+                            self.cache_read_buf[0][0].store((past_k_new, past_v_new))
+                        # 计算当前层
+                        # j=0: 使用初始hidden_states
+                        # j=1: 使用temp_hidden (第0层的输出)
+                        layer_output = self.compute_layer(i, j, k, position_ids=position_ids, generated_tokens_num=generated_tokens_num)
+                        
+                        if j == 0:
+                            k_new, v_new = self.cache_write_buf[0][0].pop()
+                            k_new_tensor = k_new.data
+                            v_new_tensor = v_new.data
+                            key = k_new_tensor.permute(1, 2, 0)  # → (b * h, d, s)
+                            value = v_new_tensor.permute(1, 0, 2)  # → (b * h, s, d)
+                            print(f"decoder, k_new: {key}, v_new: {value}, k_new.shape: {key.shape}")
+                            past_key_value = (key, value)
+                            
+                            self.cache_write_buf[0][0].store((k_new, v_new))
+                        
+                        # 存储当前层的缓存
                         # self.store_cache(i, j, k, overlap=False)
+                        # torch.cuda.synchronize()
+                        # self.store_hidden(i, j, k)
+                    
+                    # 保存当前批次的最终输出（经过所有层）
+                    print(f"forward, layer_output: {layer_output}")
+                    final_outputs.append(layer_output.data.clone())
+                    
+                    # for k in range(self.num_gpu_batches):
+                    #     self.load_cache(i, j, k, overlap=False)
+                    #     # self.load_hidden(i, j, k)
+                         
+                    #     #  Performance optimization: Reduce debug output, only enable when needed
+                    #     #  Pass the correct position_ids from the forward method parameter
+                    #     hidden_states = self.compute_layer(i, j, k, position_ids=position_ids).data.clone()  
+                    #     # self.temp_hidden.val = self.compute_layer(i, j, k).data.clone()
+                    #     # see_memory_usage('-----------------------------------------after compute_layer '+ str(i)+ '' + str(j)+' '+str(k))
+                    #     # print('self.temp_hidden ', self.temp_hidden.val.data)
+                    #     # import pdb; pdb.set_trace()
+                    #     # self.store_hidden(i, j, k)
+                    #     self.store_cache(i, j, k, overlap=False)
                 
          # Delete cache
         # for j in range(num_layers):
@@ -633,7 +693,14 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         # print('decoder hidden_states.shape --------------', hidden_states.shape)
         
         # outputs = hidden_states
-        outputs = (hidden_states,)
+        print(f"final_outputs: {len(final_outputs)}")
+        if len(final_outputs) == 1:
+            hidden_states = final_outputs[0]
+        else:
+            hidden_states = torch.cat(final_outputs, dim=0)
+        print(f"final hidden_states: {hidden_states}")
+        
+        outputs = (hidden_states, past_key_value)
         # self.temp_hidden.store(outputs) 
         # if output_attentions:
         #     outputs += (self_attn_weights,)
@@ -659,11 +726,11 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
     #######################################################################################
     def load_weight(self, i, j, k, overlap=True):
         # Handle corner cases
-        if j == self.num_layers:
-            j = 0
-            i += 1
-            if i == self.execute_gen_len:
-                return
+        # if j == self.num_layers:
+        #     j = 0
+        #     i += 1
+        #     if i == self.execute_gen_len:
+        #         return
         # Load from weight_home to weight_read_buf
         if overlap:
             with torch.cuda.stream(self.load_weight_stream):
@@ -687,20 +754,45 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         # Handle corner cases
         if i == 0:  # prefill, no cache
             return
-        if k == self.num_gpu_batches:
-            k = 0
-            j += 1
-        if j == self.num_layers:
-            j = 0
-            i += 1
-            if i == self.execute_gen_len:
-                return
+        # if k == self.num_gpu_batches:
+        #     k = 0
+        #     j += 1
+        # if j == self.num_layers:
+        #     j = 0
+        #     i += 1
+        #     if i == self.execute_gen_len:
+        #         return
         # Load from cache_home to cache_read_buf
         if overlap:
             with torch.cuda.stream(self.load_cache_stream):
                 self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
         else:
             self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
+            
+        if j == 0:
+            cache_buf = self.cache_read_buf[j][k]
+            if cache_buf.val is not None:
+                k_cache, v_cache = cache_buf.val
+                if i == 12 or i == 13:
+                    print(f"after load cache, k_cache: {k_cache}, v_cache: {v_cache}")
+                # 处理不同的cache格式
+                if isinstance(k_cache, tuple) and len(k_cache) == 2:
+                    # 如果是 (tensor, bool) 格式
+                    k_data = k_cache[0]
+                    print(f"load_cache i={i}, j={j}, k={k}: k_cache.shape={k_data.shape if hasattr(k_data, 'shape') else 'no shape'}")
+                    if hasattr(k_data, 'data'):
+                        print(f"  k_cache stats: mean={k_data.data.mean():.6f}, std={k_data.data.std():.6f}")
+                        print(f"  k_cache first few: {k_data.data.flatten()[:10]}")
+                elif hasattr(k_cache, 'shape'):
+                    # 如果是直接的tensor
+                    print(f"load_cache i={i}, j={j}, k={k}: k_cache.shape={k_cache.shape}")
+                    if hasattr(k_cache, 'data'):
+                        print(f"  k_cache stats: mean={k_cache.data.mean():.6f}, std={k_cache.data.std():.6f}")
+                        print(f"  k_cache first few: {k_cache.data.flatten()[:10]}")
+                else:
+                    print(f"load_cache i={i}, j={j}, k={k}: k_cache type={type(k_cache)}")
+            else:
+                print(f"load_cache i={i}, j={j}, k={k}: cache_read_buf.val is None")
             
     def store_cache(self, i, j, k, overlap=True):
         # Handle corner cases
@@ -712,15 +804,18 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
             i -= 1
             if i == -1:
                 return
-        if i == self.task.gen_len - 1:  # last token, no need to store cache
-            self.cache_write_buf[j][k].pop()
-            return
+        # if i == self.task.gen_len - 1:  # last token, no need to store cache
+        #     self.cache_write_buf[j][k].pop()
+        #     return
 
+        
+        print(f"store_cache in block")
         # Store cache_write_buf to cache_home
         # Delete cache_write_buf
         if overlap:
             with torch.cuda.stream(self.store_cache_stream):
                 self.layers[j].store_cache(self.cache_home[j][k], self.cache_write_buf[j][k], i)
+            torch.cuda.synchronize()
         else:
             self.layers[j].store_cache(self.cache_home[j][k], self.cache_write_buf[j][k], i)
 
@@ -756,13 +851,13 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
                 val = dst.allocate((gpu_batch_size, 1), np.int32)
                 val.load_from_np(self.output_ids[left:right, pos - 1:pos])
         else:  # load from the last layer
-            val = self.hidden[i][j - 1][k].pop().move(dst)
+            val = self.hidden[0][j - 1][k].pop().move(dst)
         
         # self.hidden[i][j][k].val = None  # 重置
-        self.hidden[i][j][k].store(val)
+        self.hidden[0][j][k].store(val)
 
     def load_hidden_mlp(self, i, j, k):
-        self.hidden[i][j][k].store(self.temp_hidden.val)
+        self.hidden[0][j][k].store(self.temp_hidden.val)
 
     def store_hidden(self, i, j, k):
         # Handle corner cases
@@ -779,7 +874,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         if j == self.num_layers - 1:  # store to output
             gpu_batch_size = self.policy.gpu_batch_size
             left, right = k * gpu_batch_size, (k + 1) * gpu_batch_size
-            ids = self.hidden[i][j][k].pop().data.detach().cpu().numpy()
+            ids = self.hidden[0][j][k].pop().data.detach().cpu().numpy()
             pos = self.task.prompt_len + i
             if self.task.stop:
                 stopped = self.stopped[left:right]
@@ -789,11 +884,11 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
             else:
                 self.output_ids[left:right, pos:pos + 1] = ids
         else:  # move to home
-            x = self.hidden[i][j][k]
+            x = self.hidden[0][j][k]
             if x.val:  # x may already be moved due to overlapping
                 x.val = x.val.move(self.act_home)
                 
-    def compute_layer(self, i, j, k, position_ids=None):
+    def compute_layer(self, i, j, k, position_ids=None, generated_tokens_num=0):
         # print('block.py compute_layer')
         # Update the hidden in place
         # Clear the weight_read_buf if it is the last gpu batch
@@ -802,7 +897,7 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         # print('compute_layer', self.hidden[i][j][k])
         # print('i, j, k  '+ str(i)+','+str(j)+','+str(k))
         if j ==1:
-            self.hidden[i][j][k].val = self.temp_hidden.val
+            self.hidden[0][j][k].val = self.temp_hidden.val
         # print('compute_layer hidden val.data.shape', self.hidden[i][j][k].val.data.shape)
         # 🚀 Performance optimization: Reduce debug output
         # print(self.hidden[i][j][k].val)
@@ -819,13 +914,14 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         # Performance optimization: Reduce memory monitoring calls
         # see_memory_usage(f"-----------------------------------------before compute_layer {j} forward pass for token {i}")
         
-        self.layers[j].forward(hidden_states=self.hidden[i][j][k], 
+        self.layers[j].forward(hidden_states=self.hidden[0][j][k], 
                                cache_read_buf=self.cache_read_buf[j][k],
                                weight_read_buf=self.weight_read_buf[j], 
                                cache_write_buf=self.cache_write_buf[j][k],
                                k=k, 
                                attention_mask=self.attention_mask[k], 
-                               position_ids=position_ids)
+                               position_ids=position_ids,
+                               generated_tokens_num=generated_tokens_num)
                                
         # Profile memory after forward pass
         # see_memory_usage(f"-----------------------------------------after compute_layer {j} forward pass for token {i}")
@@ -864,9 +960,10 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
             print(f'🔧 WrappedLlamaBlock.forward: position_ids shape={position_ids.shape}, content={position_ids}')
 
         # embed positions
+        print(f"WrappedLlamaBlock, hidden_states: {hidden_states}, seq_length: {seq_length}, past_key_value: {past_key_value}")
         if attention_mask is None:
             attention_mask = torch.ones(
-                (batch_size, seq_length_with_past), dtype=torch.bool, device=hidden_states.device
+                (batch_size, seq_length), dtype=torch.bool, device=hidden_states.device
             )
         attention_mask = _prepare_4d_causal_attention_mask(
             attention_mask=attention_mask,
@@ -874,6 +971,8 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
             inputs_embeds=hidden_states,
             past_key_values_length=past_key_values_length,
         )
+        
+        # print(f"WrappedLlamaBlock, attention_mask: {attention_mask}")
 
         outputs = super().forward( ############
             hidden_states,
@@ -884,7 +983,9 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
             use_cache=use_cache,
             **kwargs,
         )
-        print('block.py WrappedLlamaBlock forward : outputs ', outputs)
+        hidden_states, past_key_value = outputs
+        print('block.py WrappedLlamaBlock forward : outputs ', hidden_states)
+        print(f"WrappedLlamaBlock.forward, past_key_value: {past_key_value}")
         print('use_cache', use_cache)
         # use_cache
         # if use_cache:
@@ -921,7 +1022,7 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
 
 def get_test_inputs(prompt_len, num_prompts, tokenizer):
     prompts = [
-        "Simply put, the theory of relativity states that",
+        "",
         # "I believe the meaning of life is",
         # "",
         # """Translate English to French:
@@ -931,8 +1032,7 @@ def get_test_inputs(prompt_len, num_prompts, tokenizer):
         # cheese =>""",
     ]
     # Improvement: Correctly handle different prompt lengths
-    input_ids = tokenizer(prompts, padding="max_length",
-                          max_length=prompt_len, truncation=True).input_ids
-    return (input_ids[0][:prompt_len],) * num_prompts
+    input_ids = tokenizer(prompts, padding=False, truncation=True).input_ids
+    return (input_ids[0],) * num_prompts
 
 

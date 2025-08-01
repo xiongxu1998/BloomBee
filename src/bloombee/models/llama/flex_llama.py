@@ -14,7 +14,7 @@ import torch
 import torch.utils.checkpoint
 from bloombee.flexgen_utils.compression import CompressionConfig
 from bloombee.flexgen_utils.llama_config import LlamaConfig, get_llama_config, download_llama_weights
-from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import, general_copy, DeviceType, TorchDevice, TorchDisk, \
+from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import, general_copy, DeviceType, TorchDevice, TorchTensor, TorchDisk, \
     TorchMixedDevice
 from bloombee.flexgen_utils.utils import (GB, T, ValueHolder,
     array_1d, array_2d, array_3d, str2bool, project_decode_latency,
@@ -456,8 +456,19 @@ class FLEX_LlamaAttention(LlamaAttention):
         if self.policy.compress_cache:
             assert device.device_type != DeviceType.MIXED
             device = device.compressed_device
-
-        cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
+            
+        task_copy = Task(
+                inputs=self.task.inputs,
+                prompt_len=self.task.prompt_len,
+                gen_len=max(self.task.gen_len, 128),
+                cut_gen_len=self.task.cut_gen_len,
+                do_sample=self.task.do_sample,
+                temperature=self.task.temperature,
+                stop=self.task.stop,
+                top_p=self.task.top_p,
+        )
+        
+        cache = device.init_cache_one_gpu_batch(self.config, task_copy, self.policy)
         cache_home.store(cache)
 
     def load_cache(self, cache_home, cache_read_buf, i):
@@ -465,6 +476,19 @@ class FLEX_LlamaAttention(LlamaAttention):
             return
 
         k_home, v_home = cache_home.val
+        
+        cache_nan = torch.isnan(k_home.data).any()
+        cache_inf = torch.isinf(k_home.data).any()
+        print(f"load_cache[{i}]: cache_home NaN={cache_nan}, Inf={cache_inf}")
+        
+        if cache_nan:
+            # 找出哪些位置有NaN
+            nan_mask = torch.isnan(k_home.data)
+            nan_positions = nan_mask.nonzero()[:5]  # 前5个NaN位置
+            print(f"NaN positions in cache_home: {nan_positions}")
+        
+        # print(f"k_home: {k_home.data}, v_home: {v_home.data}")
+        
 
         # Pick code path
         if self.policy.compress_cache:
@@ -480,10 +504,12 @@ class FLEX_LlamaAttention(LlamaAttention):
             else:
                 path = 0
             dst = self.attention_compute
+            
+        print(f"load_cache path: {path}, current KV cache position: {i}, k_home.shape[1]: {k_home.shape[1]}")
 
         if path == 0:  # Direct copy
             # shape: (s, b * num_attention_heads, head_dim)
-            indices = (slice(0, self.task.prompt_len + i),
+            indices = (slice(0, i),
                        slice(0, k_home.shape[1]))
 
             if self.policy.attn_sparsity >= 1.0:
@@ -496,6 +522,7 @@ class FLEX_LlamaAttention(LlamaAttention):
                     k_home.smart_copy(dst, indices),
                     (v_home, False),
                 ))
+            print(f"cache_read_buf: {cache_read_buf.val[0]}")
         elif path == 1:  # Copy to CPU temporary workspace
             # shape: (s, b * num_attention_heads, head_dim)
             k_buf, v_buf = dst.next_attention_compute_workspace()
@@ -531,20 +558,56 @@ class FLEX_LlamaAttention(LlamaAttention):
         # shape: (s, b * num_attention_heads, head_dim)
         k_home, v_home = cache_home.val
         k_new, v_new = cache_write_buf.pop()
-
-        if i == self.task.gen_len - 1:  # last token, no need to store cache
-            return
-
-        if i == 0:  # prefill
-            indices = (slice(0, k_new.shape[0]),
-                       slice(0, k_new.shape[1]))
-        else:  # decoding
-            pos = self.task.prompt_len + i
-            indices = (slice(pos - k_new.shape[0], pos),
-                       slice(0, k_new.shape[1]))
+        
+        # 在store_cache中添加这个检查
+        if torch.isnan(k_new.data).any() or torch.isnan(v_new.data).any():
+            print(f"Replacing NaN values in cache at position {i}")
+            k_new.data = torch.nan_to_num(k_new.data, nan=0.0, posinf=1.0, neginf=-1.0)
+            v_new.data = torch.nan_to_num(v_new.data, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        k_has_nan = torch.isnan(k_new.data).any()
+        k_has_inf = torch.isinf(k_new.data).any()
+        v_has_nan = torch.isnan(v_new.data).any()
+        v_has_inf = torch.isinf(v_new.data).any()
+        
+        print(f"store_cache[{i}]: k_new NaN={k_has_nan}, Inf={k_has_inf}, v_new NaN={v_has_nan}, Inf={v_has_inf}")
+        
+        if k_has_nan or k_has_inf or v_has_nan or v_has_inf:
+            print(f"❌ WARNING: Storing invalid data at position {i}!")
+            print(f"k_new stats: mean={k_new.data.mean()}, std={k_new.data.std()}, min={k_new.data.min()}, max={k_new.data.max()}")
+            print(f"v_new stats: mean={v_new.data.mean()}, std={v_new.data.std()}, min={v_new.data.min()}, max={v_new.data.max()}")
+            
+            # 可选：用零替换NaN/Inf
+            # k_new.data = torch.where(torch.isnan(k_new.data) | torch.isinf(k_new.data), 
+            #                         torch.zeros_like(k_new.data), k_new.data)
+            # v_new.data = torch.where(torch.isnan(v_new.data) | torch.isinf(v_new.data), 
+            #                         torch.zeros_like(v_new.data), v_new.data)
+        
+        print(f"store_cache, i: {i}, pos: {i}, k_new.shape[0]: {k_new.shape[0]}, k_new.shape[1]: {k_new.shape[1]}")
+        # if i == self.task.gen_len - 1:  # last token, no need to store cache
+        #     return
+        print(f"store_cache, k_new: {k_new}, v_new: {v_new}")
+        # if i == 0:  # prefill
+        #     indices = (slice(0, k_new.shape[0]),
+        #                slice(0, k_new.shape[1]))
+        # else:  # decoding
+        #     pos = i
+        #     indices = (slice(pos, pos + k_new.shape[0]),
+        #                slice(0, k_new.shape[1]))
+        indices = (
+            slice(i, i + k_new.shape[0]),    # start=i, end=i+new_len
+            slice(0, k_new.shape[1])
+        )
 
         general_copy(k_home, indices, k_new, None)
         general_copy(v_home, indices, v_new, None)
+        torch.cuda.synchronize()
+        
+        stored_k = k_home.data[indices[0], indices[1]]
+        stored_v = v_home.data[indices[0], indices[1]]
+        k_stored_nan = torch.isnan(stored_k).any()
+        v_stored_nan = torch.isnan(stored_v).any()
+        print(f"After store[{i}]: k_stored NaN={k_stored_nan}, v_stored NaN={v_stored_nan}")
 
     def input_act_shape_and_dtype(self, batch_size, seq_len):
         return (batch_size, seq_len, self.config.hidden_size), self.config.dtype
@@ -575,11 +638,15 @@ class FLEX_LlamaAttention(LlamaAttention):
         else:
             ((w_q, _), (w_k, _),  (w_v, _), (w_out, _), (input_layernorm, _), (rotary_emb_inv_freq, _)) = weight_read_buf.val
 
+        print(f"attention forward, i: {i}, self.task.prompt_len: {self.task.prompt_len}, hiden states: {h}")
+        
         if i == 0:
             # prefill
             # import pdb;pdb.set_trace()---------------------
             # see_memory_usage("-----------------------------------------before mha_llama ")
+            print(f"attention forward, attention_mask: {attention_mask.val}")
             mask, donate[1] = attention_mask.val.smart_copy(self.compute)
+            print(f"attention forward, mask: {mask.data}")
             h, new_k_cache, new_v_cache = self.compute.mha_llama(h, mask, w_q, w_k, w_v, w_out,
                                        num_attention_heads, donate, self.policy.compress_cache, self.policy.comp_cache_config, input_layernorm, rotary_emb_inv_freq)
             cache_write_buf.store((new_k_cache, new_v_cache))
@@ -588,7 +655,18 @@ class FLEX_LlamaAttention(LlamaAttention):
             # decoding
             # see_memory_usage("-----------------------------------------before mha_gen_llama ")
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
-            (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
+            print(f"attention forward, mask: {mask.data}, ")
+            k_cache, v_cache = cache_read_buf.pop()
+            see_memory_usage()
+            if self.attention_compute == self.env.gpu:
+                print(f"attention_compute == gpu")
+            elif self.attention_compute == self.env.cpu:
+                print(f"attention_compute == cpu")
+            else:
+                print(f"attention_compute == {self.attention_compute}")
+            # k_cache = TorchTensor.create_from_torch(k_tensor, self.attention_compute)
+            # v_cache = TorchTensor.create_from_torch(v_tensor, self.attention_compute)
+            print(f"k_cache: {k_cache.shape}, self.policy.compress_cache: {self.policy.compress_cache}")
             h, new_k_cache, new_v_cache = self.compute.mha_gen_llama(
                 h, mask, w_q,
                 w_k, w_v, w_out, num_attention_heads,
@@ -596,10 +674,11 @@ class FLEX_LlamaAttention(LlamaAttention):
                 self.policy.compress_cache, self.policy.comp_cache_config,
                 input_layernorm,
                 rotary_emb_inv_freq)
+            print(f"attention forward, hiden state: {h}, new_k_cache: {new_k_cache}, new_v_cache: {new_v_cache}")
             cache_write_buf.store((new_k_cache, new_v_cache))
             # see_memory_usage("-----------------------------------------after mha_gen_llama ")
         hidden.val = h
-        
+        self.temp_hidden_states.val=h
         return h
 
 class FLEX_LlamaMLP(LlamaMLP):
@@ -677,7 +756,8 @@ class FLEX_LlamaMLP(LlamaMLP):
         attention_mask,
         cache_write_buf,
         position_ids,
-        k: int = 0
+        k: int = 0,
+        generated_tokens_num: int = 0,
         ):
         donate = [False] * 9
         h, donate[0] = hidden_states.val, True

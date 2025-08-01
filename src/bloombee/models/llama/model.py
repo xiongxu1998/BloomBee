@@ -89,6 +89,8 @@ class DistributedLlamaModel(FromPretrainedMixin, PTuneMixin, LlamaModel):
         hidden_states = inputs_embeds
         # print('model.py llama model inputs_embeds, ', inputs_embeds)  # Temporarily commented for cleaner debug output
         output_shape = input_shape + (hidden_states.size(-1),)
+        
+        logger.info(f"hidden_states: {hidden_states}")
 
         hidden_states = self.layers(
             hidden_states,
