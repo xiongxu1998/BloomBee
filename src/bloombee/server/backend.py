@@ -14,7 +14,7 @@ from tensor_parallel.tensor_parallel import PerDeviceTensors
 from transformers import PretrainedConfig
 
 from bloombee.data_structures import InferenceMetadata
-from bloombee.server.memory_cache import MemoryCache
+from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.task_pool import PrioritizedTaskPool
 from bloombee.utils.misc import get_size_in_bytes, is_dummy
 from bloombee.utils.memory_usage import see_memory_usage
@@ -46,7 +46,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         self,
         *args,
         config: PretrainedConfig,
-        memory_cache: MemoryCache,
+        cache_manager: cache_manager,
         backend_dtype: torch.dtype,
         max_chunk_size_bytes: int,
         **kwargs,
@@ -58,7 +58,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         super().__init__(*args, **kwargs)
         assert isinstance(self.module, TensorParallel)
         self.config = config
-        self.memory_cache = memory_cache
+        self.cache_manager = cache_manager
         self.max_chunk_size_bytes = max_chunk_size_bytes
 
         for name, param in self.module.named_parameters():
@@ -184,7 +184,7 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             
             self._ensure_model_on_device()
             
-            with self.memory_cache.use_cache(
+            with self.cache_manager.use_cache(
                 *inference_info.cache_handles  # Use cache to reduce memory requirements
             ) as cache_tensors, self._peft_module.using_adapter(inference_info.active_adapter): # Use adapter for inference
                 self._reorder_cache_inplace(cache_tensors, hypo_ids) # Reorder cache based on hypothesis IDs
