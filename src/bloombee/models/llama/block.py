@@ -554,10 +554,6 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
         self.task = task
         self.set_task(task)
         # print('self.task ', self.task)
-        if task_changed:
-            for j in range(num_layers):
-                for k in range(num_gpu_batches):
-                    self.init_cache(j, k)
         if self.policy.cpu_cache_compute:
             self.env.cpu.init_attention_compute_workspace(self.config, self.task, self.policy)
         

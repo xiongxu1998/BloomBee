@@ -29,7 +29,7 @@ from bloombee.server.backend import TransformerBackend, merge_inference_pools_in
 from bloombee.server.block_utils import get_block_size, resolve_block_dtype
 from bloombee.server.from_pretrained import load_pretrained_block
 from bloombee.server.handler import TransformerConnectionHandler
-from bloombee.server.memory_cache import MemoryCache
+from bloombee.server.memory_cache_manager import KVCacheManager
 from bloombee.server.reachability import ReachabilityProtocol, check_direct_reachability, validate_reachability
 from bloombee.server.throughput import get_dtype_name, get_server_throughput
 from bloombee.utils.auto_config import AutoDistributedConfig
@@ -523,7 +523,7 @@ class ModuleContainer(threading.Thread):
     ) -> ModuleContainer:
         module_uids = [f"{dht_prefix}{UID_DELIMITER}{block_index}" for block_index in block_indices]
         print('module_uids ', module_uids)
-        memory_cache = MemoryCache(attn_cache_bytes, max_alloc_timeout)
+        cache_manager = KVCacheManager(cache_size, max_alloc_timeout, self.policy)
 
         server_info.state = ServerState.JOINING
         dht_announcer = ModuleAnnouncerThread(
@@ -532,7 +532,7 @@ class ModuleContainer(threading.Thread):
             server_info,
             model_info,
             block_config=block_config,
-            memory_cache=memory_cache,
+            cache_manager=cache_manager,
             update_period=update_period,
             expiration=expiration,
             daemon=True,
@@ -582,7 +582,7 @@ class ModuleContainer(threading.Thread):
                     module_uid,
                     block,  ###### block instance
                     config=block_config,
-                    memory_cache=memory_cache,
+                    cache_manager=cache_manager,
                     backend_dtype=torch_dtype,
                     max_chunk_size_bytes=max_chunk_size_bytes,
                     args_schema=(
@@ -752,7 +752,7 @@ class ModuleAnnouncerThread(threading.Thread):
         model_info: ModelInfo,
         *,
         block_config: PretrainedConfig,
-        memory_cache: MemoryCache,
+        cache_manager: KVCacheManager,
         update_period: float,
         expiration: float,
         max_pinged: int = 5,
@@ -763,7 +763,7 @@ class ModuleAnnouncerThread(threading.Thread):
         self.dht = dht
         self.server_info = server_info
         self.model_info = model_info
-        self.memory_cache = memory_cache
+        self.cache_manager = cache_manager
 
         self.bytes_per_token = block_config.hidden_size * get_size_in_bytes(DTYPE_MAP[server_info.torch_dtype])
         self.bytes_per_token //= block_config.num_key_value_groups
@@ -788,7 +788,7 @@ class ModuleAnnouncerThread(threading.Thread):
         while True:
             start_time = time.perf_counter()
 
-            self.server_info.cache_tokens_left = self.memory_cache.bytes_left // self.bytes_per_token
+            self.server_info.cache_tokens_left = self.cache_manager.bytes_left() // self.bytes_per_token
             if self.server_info.state != ServerState.OFFLINE:
                 self._ping_next_servers()
                 self.server_info.next_pings = {
