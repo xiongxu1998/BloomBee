@@ -10,15 +10,22 @@ import ctypes
 import multiprocessing as mp
 import os
 import time
-from typing import AsyncContextManager, Dict, Optional, Sequence
+from typing import AsyncContextManager, Dict, Optional, Sequence, Tuple, Union, Any, List
 
 import async_timeout
 import torch
+import dataclasses
 from hivemind.utils import TensorDescriptor, enter_asynchronously, get_logger
+
+from transformers import PretrainedConfig
 
 from bloombee.data_structures import Handle
 from bloombee.utils.asyncio import shield_and_wait
 from bloombee.utils.misc import get_size_in_bytes
+from bloombee.flexgen_utils.policy import Policy
+from bloombee.flexgen_utils.task import Task
+
+from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
 
 logger = get_logger(__name__)
 
@@ -26,19 +33,40 @@ logger = get_logger(__name__)
 class MemoryCache:
     """A shared cache for storing tensors that persist across calls. Main use case: storing past attention KVs"""
 
-    def __init__(self, max_size_bytes: Optional[int], max_alloc_timeout: Optional[float] = None):
+    def __init__(self, 
+                 max_size_bytes: Optional[int], 
+                 max_alloc_timeout: Optional[float] = None, 
+                 policy: Optional[Policy] = None, 
+                 block_config: Optional[PretrainedConfig] = None,
+                 device: Any = None):
         self.max_size_bytes = max_size_bytes if max_size_bytes is not None else (2**64 - 1)
         self.max_alloc_timeout = max_alloc_timeout
         self._lock_metadata = mp.Lock()
         self._current_size = mp.Value(ctypes.c_int64, 0, lock=False)
         self._enqueued_size = mp.Value(ctypes.c_int64, 0, lock=True)
         self._handle_counter = mp.Value(ctypes.c_int64, 0, lock=False)
-        self._allocated_tensors: Dict[Handle, torch.Tensor] = {}
+        self._allocated_tensors: Dict[Handle, Any] = {}
         self.runtime_pid = os.getpid()
 
         self._pipe_recv, self._pipe_send = mp.Pipe(duplex=False)  # any ConnectionHandler -> runtime
         self._lock_acquire_memory = mp.Lock()
         self._memory_freed_event = mp.Event()
+        
+        # flexgen' offloading depends on the task parameter, we need to mock a temp task variable for memory allocation without changing the data structure of flexgen.
+        self.mocked_task = Task(
+                inputs=None,
+                prompt_len=0,
+                gen_len=2048,
+                cut_gen_len=None,
+                do_sample=False,
+                temperature=0,
+                stop=None,
+                top_p=None,
+        )
+        self.allocation_policy = policy
+        self.block_config = block_config
+        self.device = device
+        
 
     @property
     def current_size_bytes(self) -> int:
@@ -68,52 +96,7 @@ class MemoryCache:
     def handle_counter(self, value: int):
         self._handle_counter.value = value
 
-    @contextlib.asynccontextmanager
-    async def allocate_cache(
-        self, *descriptors: TensorDescriptor, timeout: float
-    ) -> AsyncContextManager[Sequence[Handle]]:
-        """
-        Create a handle that is associated with buffers on unique device. If cache full, raises AllocationFailed.
-
-        :param descriptors: one or more tensors tensor of this size, dtype, etc
-        :param timeout: optional maximum time to wait for cache allocation; None (default) means no time limit
-
-        :note: if descriptors reside on different devices, it is expected that they are approximately balanced across devices;
-          if not, it will count maximum tensor allocation across devices for the purposes of size limit
-
-        :note: This function should be called by connection handlers, it can be called concurrently from multiple processes.
-        Furthermore, it can be called concurrently with at most one use_cache call in runtime.
-        """
-        assert os.getpid() != self.runtime_pid, "must be called by a ConnectionHandler, not runtime"
-        assert all(descr.device is not None for descr in descriptors), "please specify allocated devices"
-        if self.max_alloc_timeout is not None:
-            timeout = min(timeout, self.max_alloc_timeout)
-        max_alloc_size = self.get_allocation_size(*descriptors)
-
-        gib = 1024**3
-        cur_size, max_size = self.current_size_bytes, self.max_size_bytes
-        friendly_max_size = f"{max_size / gib:.2f}" if max_size != 2**64 - 1 else "inf"
-        logger.info(
-            f"rpc_inference.wait_for_alloc(size={max_alloc_size / gib:.2f} GiB), "
-            f"already used {cur_size / gib:.2f}/{friendly_max_size} GiB ({cur_size / max_size * 100:.1f}%)"
-        )
-
-        alloc_task = asyncio.create_task(self._schedule_alloc(max_alloc_size, *descriptors, timeout=timeout))
-        try:
-            handles = await shield_and_wait(alloc_task)
-            logger.info(f"rpc_inference.alloc_done(size={max_alloc_size / gib:.2f} GiB)")
-            yield handles
-        finally:
-            self._free(max_alloc_size, alloc_task)
-
-    @staticmethod
-    def get_allocation_size(*descriptors: TensorDescriptor) -> int:
-        """Return the memory size (bytes) to be allocated on a device. If there are many devices, return maximum"""
-        alloc_size_by_device = {}
-        for descr in descriptors:
-            tensor_size = descr.numel() * get_size_in_bytes(descr.dtype)
-            alloc_size_by_device[descr.device] = alloc_size_by_device.get(descr.device, 0) + tensor_size
-        return max(alloc_size_by_device.values())
+    
 
     async def _schedule_alloc(
         self, alloc_size: int, *descriptors: TensorDescriptor, timeout: Optional[float]
@@ -209,7 +192,7 @@ class MemoryCache:
             if recv_data is not None:  # create new tensors
                 assert len(recv_handles) == len(recv_data)
                 for handle, descr in zip(recv_handles, recv_data):
-                    self._allocated_tensors[handle] = descr.make_zeros()
+                    self._allocated_tensors[handle] = device.init_cache_one_gpu_batch(self.block_config, self.mocked_task, self.allocation_policy)
                     assert handle in self._allocated_tensors, f"Sanity check failed: no such handle ({handle})"
             else:  # delete tensors by handle
                 for handle in recv_handles:
@@ -223,3 +206,16 @@ class MemoryCache:
 
 class AllocationFailed(Exception):
     pass
+
+class KVCacheMetadata:
+    device: Any               # 存在哪个设备上
+    offloaded: bool = False             # 是否已 offload 到 CPU
+    # TODO: add more device info
+
+
+@dataclasses.dataclass(frozen=True)
+class AdaptedKVCache:
+    kvs: Sequence[torch.Tensor]
+    device: KVCacheMetadata
+
+

@@ -523,7 +523,7 @@ class ModuleContainer(threading.Thread):
     ) -> ModuleContainer:
         module_uids = [f"{dht_prefix}{UID_DELIMITER}{block_index}" for block_index in block_indices]
         print('module_uids ', module_uids)
-        cache_manager = KVCacheManager(cache_size, max_alloc_timeout, self.policy)
+        cache_manager = KVCacheManager(attn_cache_bytes, max_alloc_timeout, policy, env, block_config)
 
         server_info.state = ServerState.JOINING
         dht_announcer = ModuleAnnouncerThread(

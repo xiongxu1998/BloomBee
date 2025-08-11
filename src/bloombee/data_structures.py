@@ -6,8 +6,6 @@ import pydantic
 from hivemind import PeerID
 from hivemind.moe.expert_uid import ExpertUID
 
-from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
-
 ModuleUID = str
 UID_DELIMITER = "."  # delimits parts of one module uid, e.g. "bloom.transformer.h.4.self_attention"
 CHAIN_DELIMITER = " "  # delimits multiple uids in a sequence, e.g. "bloom.layer3 bloom.layer4"
@@ -117,14 +115,4 @@ class InferenceMetadata:
     prefix_length: int
     cache_handles: Tuple[Handle, ...]
     active_adapter: Optional[str]
-    
-    
-@dataclasses.dataclass(frozen=True)
-class KVCache:
-    kvs: Sequence[torch.Tensor]
-    device: KVCacheMetadata
 
-class KVCacheMetadata:
-    device: TorchDevice               # 存在哪个设备上
-    offloaded: bool = False             # 是否已 offload 到 CPU
-    # TODO: add more device info

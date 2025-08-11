@@ -21,7 +21,7 @@ from bloombee.flexgen_utils.utils import (GB, T, ValueHolder,
     torch_mem_stats, torch_dtype_to_np_dtype, write_benchmark_log,
     read_benchmark_log)
 from bloombee.flexgen_utils.task import Task
-from bloombee.flexgen_utils.Policy import Policy
+from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
 from torch import nn
 from transformers import AutoTokenizer
