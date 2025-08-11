@@ -600,15 +600,27 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
                         # 加载当前层的缓存
                         # self.load_cache(i, j, k, overlap=False)
                         # self.load_hidden(i, j, k)
-                        if j == 0:
+                        if j == 0 and past_key_value is not None:
                             past_key, past_value = past_key_value
-                            print(f"forward, past_key: {past_key}, past_value: {past_value}")
+                            # Normalize past shapes into [B, H, S, D]
+                            if past_key.dim() == 3:
+                                # from backend packed: [B*H, D, S] or [B*H, S, D]
+                                bh, x1, x2 = past_key.shape
+                                b = hidden_states.shape[0]
+                                h = bh // b
+                                d = self.self_attn.head_dim
+                                s = x2 if x1 == d else x1
+                                if x1 == d and x2 == s:
+                                    k_bhsd = past_key.permute(0, 2, 1)
+                                else:
+                                    k_bhsd = past_key
+                                v_bhsd = past_value if past_value.shape[1] == s else past_value.permute(0, 2, 1)
+                                past_key = k_bhsd.view(b, h, s, d)
+                                past_value = v_bhsd.view(b, h, s, d)
+                            # Transform to FlexGen expected (s, b*h, d)
                             b, h, s, d = past_key.shape
-
-                            # 转换成 (s, b * h, d)
                             past_k_new = past_key.permute(2, 0, 1, 3).contiguous().view(s, b * h, d)
                             past_v_new = past_value.permute(2, 0, 1, 3).contiguous().view(s, b * h, d)
-                            
                             self.cache_read_buf[0][0].store((past_k_new, past_v_new))
                         # 计算当前层
                         # j=0: 使用初始hidden_states
@@ -617,11 +629,14 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
                         
                         if j == 0:
                             k_new, v_new = self.cache_write_buf[0][0].pop()
-                            k_new_tensor = k_new.data
-                            v_new_tensor = v_new.data
-                            key = k_new_tensor.permute(1, 2, 0)  # → (b * h, d, s)
-                            value = v_new_tensor.permute(1, 0, 2)  # → (b * h, s, d)
-                            print(f"decoder, k_new: {key}, v_new: {value}, k_new.shape: {key.shape}")
+                            k_new_tensor = k_new.data  # (s, b*h, d)
+                            v_new_tensor = v_new.data  # (s, b*h, d)
+                            # Backend expects new_kvs shapes:
+                            #   key:   (b*h, d, s)
+                            #   value: (b*h, s, d)
+                            key = k_new_tensor.permute(1, 2, 0)  # → (b*h, d, s)
+                            value = v_new_tensor.permute(1, 0, 2)  # → (b*h, s, d)
+                            print(f"decoder, k_new shaped for backend: {key.shape}, v_new: {value.shape}")
                             past_key_value = (key, value)
                             
                             self.cache_write_buf[0][0].store((k_new, v_new))
@@ -997,12 +1012,37 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
         self, key_value: Tuple[torch.Tensor], batch_size: int, seq_length: int
     ) -> Tuple[torch.Tensor]:
         key_states, value_states = key_value
-        key_states = key_states.permute(0, 2, 1)
-        key_states = key_states.view(
-            batch_size, self.self_attn.num_key_value_heads, seq_length, self.self_attn.head_dim
-        )
-        value_states = value_states.view(*key_states.shape)
-        return (key_states, value_states)
+        # If already in [B, H, S, D], return as-is
+        if key_states.dim() == 4 and value_states.dim() == 4:
+            return key_states, value_states
+        # Otherwise, expect Bloom-style packed heads: key [B*H, D, S] or [B*H, S, D], value [B*H, S, D] or [B*H, D, S]
+        if key_states.dim() == 3:
+            bh, d1, d2 = key_states.shape
+            # Make key [B*H, S, D]
+            if d2 == self.self_attn.head_dim and d1 == seq_length:
+                # currently [B*H, S, D] — ok
+                key_bhsd = key_states
+            elif d1 == self.self_attn.head_dim and d2 == seq_length:
+                # currently [B*H, D, S] — permute
+                key_bhsd = key_states.permute(0, 2, 1).contiguous()
+            else:
+                # Fallback: assume second dim is sequence
+                key_bhsd = key_states.permute(0, 2, 1).contiguous()
+
+            # Value to [B*H, S, D]
+            if value_states.shape[1] == seq_length:
+                val_bhsd = value_states
+            else:
+                val_bhsd = value_states.permute(0, 2, 1).contiguous()
+
+            # Reshape into [B, H, S, D]
+            h = self.self_attn.num_key_value_heads
+            d = self.self_attn.head_dim
+            key_out = key_bhsd.view(batch_size, h, seq_length, d)
+            val_out = val_bhsd.view(batch_size, h, seq_length, d)
+            return (key_out, val_out)
+        # Unexpected shapes; return as-is to avoid crashes
+        return key_states, value_states
 
     def _reorder_cache_from_llama_to_bloom(
         self, key_value: Tuple[torch.Tensor], batch_size: int, seq_length: int

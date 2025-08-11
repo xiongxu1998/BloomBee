@@ -187,7 +187,6 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             with self.cache_manager.use_cache(
                 *inference_info.cache_handles  # Use cache to reduce memory requirements
             ) as cache_tensors, self._peft_module.using_adapter(inference_info.active_adapter): # Use adapter for inference
-                self._reorder_cache_inplace(cache_tensors, hypo_ids) # Reorder cache based on hypothesis IDs
 
                 # We chunk the inputs so that peak memory for long sequences fits into `autograd_memory`
                 # reserved in `Server._choose_num_blocks()`. This saves us from OOMs if `max_chunk_size_bytes`
@@ -197,7 +196,12 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 # see_memory_usage("transformer backend inference step : seq_len")
                 output_hidden_states = torch.empty_like(hidden_states) if seq_len > max_chunk_length else None # Initialize output states
                 # print("transformer backend inference step : output_hidden_states", output_hidden_states) # output_hidden_states:None
-                layer_past = self._select_layer_past(cache_tensors, inference_info.prefix_length) # Select previous layer's cache state
+                # Centralized select: aggregate + reorder + slice
+                selected = self.cache_manager.select_cache(
+                    prefix_length=inference_info.prefix_length,
+                    hypo_ids=hypo_ids,
+                )
+                layer_past = selected
                 
                 for offset in range(0, seq_len, max_chunk_length): # Iterate through sequence to process hidden states in chunks   only run offset=0
                     hidden_states_chunk = hidden_states[:, offset : offset + max_chunk_length, :] # Get current hidden states chunk
@@ -250,7 +254,8 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
                 past_key_values_length = 0
                 if layer_past is not None and len(layer_past) > 0:
                     past_key_values_length = layer_past[0].shape[2]
-                self._update_cache_inplace(cache_tensors, new_kvs, past_key_values_length) # Update cache
+                # Centralized KV update via KVCacheManager (logs OFFLOAD: KV write ...)
+                self.cache_manager.update_cache(new_kvs, past_key_values_length)
                 print('backend.py output_hidden_states.shape ', output_hidden_states.shape)
                 return (output_hidden_states,) # Return output hidden states
                 
@@ -274,29 +279,9 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
             for cache_tensor in cache_tensors:
                 cache_tensor[...] = cache_tensor[hypo_ids.to(cache_tensor.device)]  # in-place reorder cache by hypo ids
 
-    def _select_layer_past(self, cache_tensors: Sequence[torch.Tensor], prefix_length: int) -> Sequence[torch.Tensor]:
-        """Extract first {prefix_length} tokens and reshape them such that they can be used as layer_past"""
-        key_cache, value_cache = list(cache_tensors[0::2]), list(cache_tensors[1::2])
-        for i in range(len(key_cache)):
-            key_cache[i] = key_cache[i].flatten(0, 1)[:, :, :prefix_length]
-            # shape: [batch * num_kv_heads, head_dim, kv_length]
-            value_cache[i] = value_cache[i].flatten(0, 1)[:, :prefix_length]
-            # shape: [batch * num_kv_heads, kv_length, head_dim]
-        layer_past = tuple(chain(*zip(key_cache, value_cache)))
-        return PerDeviceTensors(*layer_past) if len(self.module.module_shards) > 1 else layer_past
+    # Selection is centralized in KVCacheManager.select_cache()
 
-    def _update_cache_inplace(
-        self, cache_tensors: Sequence[torch.Tensor], new_kvs: Sequence[torch.Tensor], prefix_length: int
-    ):
-        """Writes new key/value tensors back into cache, works in-place"""
-        _batch_size_times_num_kv_heads, head_dim, new_length = new_kvs[0].shape
-        logger.info(f"_batch_size_times_num_kv_heads: {_batch_size_times_num_kv_heads}, head_dim: {head_dim}, new_length: {new_length}")
-        for cache_key, new_key in zip(cache_tensors[0::2], new_kvs[0::2]):
-            new_key = new_key.view(*cache_key.shape[:3], new_length)
-            cache_key[:, :, :, prefix_length:prefix_length+new_length] = new_key
-        for cache_value, new_value in zip(cache_tensors[1::2], new_kvs[1::2]):
-            new_value = new_value.view(*cache_value.shape[:2], new_length, head_dim)
-            cache_value[:, :, prefix_length:prefix_length+new_length, :] = new_value
+    # Cache writing is centralized in KVCacheManager.update_cache()
 
     def get_pools(self) -> Sequence[PrioritizedTaskPool]:
         return self.forward_pool, self.backward_pool, self.inference_pool

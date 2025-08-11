@@ -25,7 +25,9 @@ from bloombee.utils.misc import get_size_in_bytes
 from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.task import Task
 
-from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
+from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice, DeviceType, general_copy
+from bloombee.flexgen_utils.utils import torch_dtype_to_np_dtype
+import numpy as np
 
 logger = get_logger(__name__)
 
@@ -46,6 +48,7 @@ class MemoryCache:
         self._enqueued_size = mp.Value(ctypes.c_int64, 0, lock=True)
         self._handle_counter = mp.Value(ctypes.c_int64, 0, lock=False)
         self._allocated_tensors: Dict[Handle, Any] = {}
+        self._handle_size_bytes: Dict[Handle, int] = {}
         self.runtime_pid = os.getpid()
 
         self._pipe_recv, self._pipe_send = mp.Pipe(duplex=False)  # any ConnectionHandler -> runtime
@@ -66,6 +69,11 @@ class MemoryCache:
         self.allocation_policy = policy
         self.block_config = block_config
         self.device = device
+        # For disk/mixed staging
+        self._underlying: Dict[Handle, Any] = {}
+        self._cpu_stage: Dict[Handle, Any] = {}
+        self._layout_meta: Dict[Handle, Tuple[bool, int, int, int, int]] = {}  # (is_key, B, H, S, D)
+        self._dtype_by_handle: Dict[Handle, torch.dtype] = {}
         
 
     @property
@@ -192,16 +200,155 @@ class MemoryCache:
             if recv_data is not None:  # create new tensors
                 assert len(recv_handles) == len(recv_data)
                 for handle, descr in zip(recv_handles, recv_data):
-                    self._allocated_tensors[handle] = device.init_cache_one_gpu_batch(self.block_config, self.mocked_task, self.allocation_policy)
-                    assert handle in self._allocated_tensors, f"Sanity check failed: no such handle ({handle})"
+                    shape = tuple(descr.shape)
+                    B, H = shape[0], shape[1]
+                    head_dim_cfg = self.block_config.hidden_size // self.block_config.num_attention_heads if self.block_config is not None else shape[-1]
+                    if shape[-2] == head_dim_cfg:
+                        is_key, D, S = True, shape[-2], shape[-1]
+                    else:
+                        is_key, S, D = False, shape[-2], shape[-1]
+
+                    nbytes = int(np.prod(shape)) * get_size_in_bytes(descr.dtype)
+                    self._handle_size_bytes[handle] = nbytes
+                    self._dtype_by_handle[handle] = descr.dtype
+
+                    if isinstance(self.device, TorchDisk):
+                        np_dtype = torch_dtype_to_np_dtype.get(descr.dtype, np.float16)
+                        underlying = self.device.allocate((S, B * H, D), np_dtype, pin_memory=False)
+                        self._underlying[handle] = underlying
+                        self._layout_meta[handle] = (is_key, B, H, S, D)
+                        self._allocated_tensors[handle] = None
+                        logger.info(
+                            f"OFFLOAD: Prepared FlexGen KV storage handle={handle} base_shape={(S, B*H, D)} from desc={shape} on {type(self.device).__name__}"
+                        )
+                    elif isinstance(self.device, TorchMixedDevice):
+                        # Mixed device requires segment lengths for split along BH dimension
+                        np_dtype = torch_dtype_to_np_dtype.get(descr.dtype, np.float16)
+                        # derive seg lengths from policy (gpu/cpu/disk split along BH)
+                        # note: BH is divisible by num_attention_heads, round segments as in init_cache_one_gpu_batch
+                        num_heads = self.block_config.num_attention_heads if self.block_config is not None else H
+                        total = B * H
+                        raw_gpu = int(total * (self.allocation_policy.cache_gpu_percent / 100.0))
+                        raw_cpu = int(total * (self.allocation_policy.cache_cpu_percent / 100.0))
+                        len_gpu = (raw_gpu // num_heads) * num_heads
+                        len_cpu = (raw_cpu // num_heads) * num_heads
+                        len_disk = max(0, total - len_gpu - len_cpu)
+                        # Guard: very small disk tail hurts stability; fold it into CPU
+                        if len_disk < num_heads and len_disk > 0:
+                            len_cpu += len_disk
+                            len_disk = 0
+                            logger.info(
+                                f"OFFLOAD: Mixed seg_lengths small disk tail folded into CPU => [gpu={len_gpu}, cpu={len_cpu}, disk={len_disk}]"
+                            )
+                        # If policy requests CPU but rounding zeroed it (small BH), prefer CPU-only over disk-only
+                        if self.allocation_policy.cache_cpu_percent > 0 and len_cpu == 0 and total >= num_heads:
+                            len_cpu = total
+                            len_gpu = 0
+                            len_disk = 0
+                            logger.info(
+                                f"OFFLOAD: Mixed seg_lengths forced CPU-only due to small BH => [gpu={len_gpu}, cpu={len_cpu}, disk={len_disk}]"
+                            )
+                        seg_lengths = [len_gpu, len_cpu, len_disk]
+                        underlying = self.device.allocate((S, B * H, D), np_dtype, seg_lengths=seg_lengths, pin_memory=False)
+                        self._underlying[handle] = underlying
+                        self._layout_meta[handle] = (is_key, B, H, S, D)
+                        self._allocated_tensors[handle] = None
+                        logger.info(
+                            f"OFFLOAD: Prepared FlexGen KV storage (mixed) handle={handle} base_shape={(S, B*H, D)} seg_lengths={seg_lengths}"
+                        )
+                    else:
+                        is_cpu = (getattr(descr.device, 'type', str(descr.device)) == 'cpu')
+                        try:
+                            tensor = torch.empty(shape, dtype=descr.dtype, device=descr.device, pin_memory=True if is_cpu else False)
+                            tensor.zero_()
+                        except TypeError:
+                            tensor = torch.zeros(shape, dtype=descr.dtype, device=descr.device)
+                        self._allocated_tensors[handle] = tensor
+                        logger.info(
+                            f"OFFLOAD: Allocated KV tensor handle={handle} shape={shape} dtype={descr.dtype} device={descr.device}"
+                        )
+                    assert handle in self._handle_size_bytes, f"Sanity check failed: no size for handle ({handle})"
             else:  # delete tensors by handle
                 for handle in recv_handles:
                     if handle not in self._allocated_tensors:
                         logger.warning(
                             f"Sanity check failed: asked to delete handle {handle}, but there is no such handle"
                         )
+                    else:
+                        logger.info(f"OFFLOAD: Freed KV tensor handle={handle}")
                     self._allocated_tensors.pop(handle, None)
-        yield tuple(self._allocated_tensors[handle] for handle in handles)
+                    self._handle_size_bytes.pop(handle, None)
+                    self._underlying.pop(handle, None)
+                    self._layout_meta.pop(handle, None)
+                    self._cpu_stage.pop(handle, None)
+                    self._dtype_by_handle.pop(handle, None)
+        # Materialize CPU tensors for FlexGen-backed handles
+        materialized: List[torch.Tensor] = []
+        for handle in handles:
+            if handle in self._underlying:
+                is_key, B, H, S, D = self._layout_meta[handle]
+                BH = B * H
+                torch_dtype = self._dtype_by_handle.get(handle, torch.float16)
+                stage_np_dtype = torch_dtype_to_np_dtype.get(torch_dtype, np.float16)
+                cpu_stage = TorchDevice("cpu").allocate((S, BH, D), stage_np_dtype, pin_memory=True)
+                try:
+                    general_copy(cpu_stage, None, self._underlying[handle], None)
+                except Exception as e:
+                    logger.warning(f"OFFLOAD: copy-in failed for handle={handle}: {e}. Filling zeros.")
+                    # initialize stage to zeros to keep shapes consistent
+                    cpu_stage.data.zero_()
+                if is_key:
+                    # View-only transform to [B, H, D, S]; keep it as a view so in-place writes update cpu_stage
+                    tensor = cpu_stage.data.view(S, B, H, D).permute(1, 2, 3, 0)
+                else:
+                    # View-only transform to [B, H, S, D]
+                    tensor = cpu_stage.data.view(S, B, H, D).permute(1, 2, 0, 3)
+                self._cpu_stage[handle] = cpu_stage
+                self._allocated_tensors[handle] = tensor
+                materialized.append(tensor)
+            else:
+                # It is possible that this handle was created for underlying only
+                # Ensure presence; otherwise initialize a zero CPU tensor as a fallback
+                tensor = self._allocated_tensors.get(handle)
+                if tensor is None:
+                    # Fallback zero tensor based on recorded layout
+                    is_key, B, H, S, D = self._layout_meta[handle]
+                    if is_key:
+                        tensor = torch.zeros((B, H, D, S), dtype=self._dtype_by_handle.get(handle, torch.float16), device='cpu', pin_memory=True)
+                    else:
+                        tensor = torch.zeros((B, H, S, D), dtype=self._dtype_by_handle.get(handle, torch.float16), device='cpu', pin_memory=True)
+                    self._allocated_tensors[handle] = tensor
+                materialized.append(tensor)
+
+        try:
+            yield tuple(materialized)
+        finally:
+            for handle in handles:
+                if handle in self._underlying and handle in self._cpu_stage:
+                    try:
+                        general_copy(self._underlying[handle], None, self._cpu_stage[handle], None)
+                        logger.info(f"OFFLOAD: Synced KV handle={handle} back to {type(self.device).__name__}")
+                    except Exception as e:
+                        logger.warning(f"OFFLOAD: copy-out failed for handle={handle}: {e}. Skipping sync.")
+
+    def force_free(self, *handles: Handle):
+        """Force free handles immediately (outside of allocate context). Adjust size counters and wake waiters."""
+        with self._lock_metadata:
+            freed_bytes = 0
+            for handle in handles:
+                tensor = self._allocated_tensors.pop(handle, None)
+                size_bytes = self._handle_size_bytes.pop(handle, 0)
+                if tensor is not None:
+                    freed_bytes += size_bytes
+                    logger.info(f"OFFLOAD: Force free KV tensor handle={handle}, bytes={size_bytes}")
+                if handle in self._underlying:
+                    self._underlying.pop(handle, None)
+                    self._layout_meta.pop(handle, None)
+                    self._cpu_stage.pop(handle, None)
+                    self._dtype_by_handle.pop(handle, None)
+            if freed_bytes:
+                self.current_size_bytes = max(0, self.current_size_bytes - freed_bytes)
+                self._memory_freed_event.set()
 
 
 class AllocationFailed(Exception):
