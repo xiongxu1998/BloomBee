@@ -55,7 +55,6 @@ class KVCacheManager:
             device = device.compressed_device
         return device
 
-
     def clear(self):
         # for b in range(self.max_batch_size):
         #     for l in range(self.num_layers):
