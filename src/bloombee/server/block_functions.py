@@ -247,9 +247,9 @@ async def iterate_rpc_inference(
             for i, (backend, handles) in enumerate(zip(requested_backends, cache_handles)):
                 cache_manager = backend.cache_manager
                 offload_logger.info(f"   - 后端{i}: {len(handles)}个缓存句柄")
-                offload_logger.info(f"     GPU缓存比例: {cache_manager.policy.cache_gpu_percent}%")
-                offload_logger.info(f"     CPU缓存比例: {cache_manager.policy.cache_cpu_percent}%")
-                offload_logger.info(f"     CPU缓存计算: {cache_manager.policy.cpu_cache_compute}")
+                offload_logger.info(f"     GPU缓存比例: {cache_manager.offloading_policy.cache_gpu_percent}%")
+                offload_logger.info(f"     CPU缓存比例: {cache_manager.offloading_policy.cache_cpu_percent}%")
+                offload_logger.info(f"     CPU缓存计算: {cache_manager.offloading_policy.cpu_cache_compute}")
             
             if can_merge_pools:
                 print('-=-=-=-=-=-=-=-==-=- come into can merge pools : ', can_merge_pools)

@@ -20,7 +20,7 @@ import dataclasses
 from hivemind.utils import TensorDescriptor, enter_asynchronously, get_logger
 
 
-from bloombee.data_structures import Handle, UnifiedCache, DeviceInfo
+from bloombee.data_structures import Handle
 from transformers import PretrainedConfig
 
 from bloombee.utils.asyncio import shield_and_wait

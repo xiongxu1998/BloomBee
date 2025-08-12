@@ -163,25 +163,9 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         self._cached_task = None
         self._is_initialized = False
 
-        self.cache_manager = None
-        self._init_cache_manager()
-
         self.init_all_weights()
 
         self.temp_hidden = ValueHolder()
-
-    def _init_cache_manager(self):
-        from bloombee.server.memory_cache_manager import init_cache_manager_shared
-        from bloombee.server.cache_coordinator import get_cache_interface, create_device_info_from_policy
-
-        self.cache_interface = get_cache_interface()
-        if self.cache_interface is not None:
-            self.cache_interface.register_layer(self.layer_id, {
-                'layer_type': 'llama_decoder',
-                'policy': self.policy
-            })
-
-        self.cache_manager = init_cache_manager_shared(self.policy, self.layer_id)
 
     def set_task(self, task):
         self.task = task
@@ -458,7 +442,8 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
                     x.delete()
 
     def init_cache(self, j, k):
-        self.layers[j].init_cache_one_gpu_batch(self.cache_home[j][k])
+        # self.layers[j].init_cache_one_gpu_batch(self.cache_home[j][k])
+        pass
 
     def load_cache(self, i, j, k, overlap=True):
         if i == 0:
@@ -470,27 +455,6 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):
         else:
             self.layers[j].load_cache(self.cache_home[j][k], self.cache_read_buf[j][k], i)
 
-        if j == 0:
-            cache_buf = self.cache_read_buf[j][k]
-            if cache_buf.val is not None:
-                k_cache, v_cache = cache_buf.val
-                if i == 12 or i == 13:
-                    print(f"after load cache, k_cache: {k_cache}, v_cache: {v_cache}")
-                if isinstance(k_cache, tuple) and len(k_cache) == 2:
-                    k_data = k_cache[0]
-                    print(f"load_cache i={i}, j={j}, k={k}: k_cache.shape={k_data.shape if hasattr(k_data, 'shape') else 'no shape'}")
-                    if hasattr(k_data, 'data'):
-                        print(f"  k_cache stats: mean={k_data.data.mean():.6f}, std={k_data.data.std():.6f}")
-                        print(f"  k_cache first few: {k_data.data.flatten()[:10]}")
-                elif hasattr(k_cache, 'shape'):
-                    print(f"load_cache i={i}, j={j}, k={k}: k_cache.shape={k_cache.shape}")
-                    if hasattr(k_cache, 'data'):
-                        print(f"  k_cache stats: mean={k_cache.data.mean():.6f}, std={k_cache.data.std():.6f}")
-                        print(f"  k_cache first few: {k_cache.data.flatten()[:10]}")
-                else:
-                    print(f"load_cache i={i}, j={j}, k={k}: k_cache type={type(k_cache)}")
-            else:
-                print(f"load_cache i={i}, j={j}, k={k}: cache_read_buf.val is None")
 
     def store_cache(self, i, j, k, overlap=True):
         if k == -1:
@@ -629,50 +593,6 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
             past_key_values_length=past_key_values_length,
         )
 
-        import logging
-        offload_logger = logging.getLogger('bloombee.offloading')
-
-        if position_ids is not None:
-            if position_ids.shape == (1, 1) and position_ids[0][0].item() == 0:
-                current_position = 0
-            else:
-                current_position = position_ids[0][0].item()
-        else:
-            if past_key_value is not None:
-                current_position = past_key_value[0].shape[2]
-            else:
-                current_position = 0
-
-        layer_id = getattr(self, 'layer_id', 0)
-
-        offload_logger.info(f" position info - current_position:{current_position}, layer_id:{layer_id}")
-        if position_ids is not None:
-            offload_logger.info(f"   - position_ids shape: {position_ids.shape}")
-            offload_logger.info(f"   - position_ids: {position_ids}")
-        if past_key_value is not None:
-            offload_logger.info(f"   - past_key_value length: {past_key_value[0].shape[2]}")
-
-        if hasattr(self, 'cache_interface') and self.cache_interface is not None and current_position > 0:
-            offload_logger.info(f" WrappedLlamaBlock.load_cache - pos:{current_position}, layer:{layer_id}")
-            try:
-                result = self.cache_interface.load_cache(layer_id, current_position, str(hidden_states.device), 0)
-                if result is not None:
-                    offload_logger.info(f" load cache - pos:{current_position}, layer:{layer_id}")
-                else:
-                    offload_logger.warning(f" cache not exist - pos:{current_position}, 层:{layer_id}")
-            except Exception as e:
-                offload_logger.warning(f"{e}")
-        elif hasattr(self, 'cache_manager') and self.cache_manager is not None and current_position > 0:
-            offload_logger.info(f" WrappedLlamaBlock.load_cache (fallback) - :{current_position}, :{layer_id}")
-            try:
-                result = self.cache_manager.load_cache(current_position, layer_id, 0)
-                if result is not None:
-                    offload_logger.info(f" 成功加载缓存 (fallback) - :{current_position}, :{layer_id}")
-                else:
-                    offload_logger.warning(f":{current_position}, :{layer_id}")
-            except Exception as e:
-                offload_logger.warning(f" KVCacheManager load_cache fail: {e}")
-
         outputs = super().forward(
             hidden_states,
             *args,
@@ -683,46 +603,9 @@ class WrappedLlamaBlock(OptimizedLlamaDecoderLayer):
             **kwargs,
         )
         hidden_states, past_key_value = outputs
-        print('block.py WrappedLlamaBlock forward : outputs ', hidden_states)
-        print(f"WrappedLlamaBlock.forward, past_key_value: {past_key_value}")
-        print('use_cache', use_cache)
-
-        if hasattr(self, 'cache_interface') and self.cache_interface is not None:
-            offload_logger.info(f"WrappedLlamaBlock.store_cache - pos:{current_position}, layer:{layer_id}")
-            try:
-                if past_key_value is not None:
-                    handle = self.cache_interface.store_cache(layer_id, current_position, past_key_value, hidden_states.device, 0)
-                    if handle is not None:
-                        offload_logger.info(f"load cache - pos:{current_position}, layer:{layer_id}, handle:{handle}")
-                    else:
-                        offload_logger.warning(f"load cache fail:{current_position}, layer:{layer_id}")
-                else:
-                    offload_logger.warning(f" past_key_value is empty，skip store_cache")
-            except Exception as e:
-                offload_logger.warning(f"store_cache fail: {e}")
-        elif hasattr(self, 'cache_manager') and self.cache_manager is not None:
-            offload_logger.info(f"WrappedLlamaBlock.store_cache (fallback) - pos:{current_position}, layer:{layer_id}")
-            try:
-                from bloombee.server.memory_cache import UnifiedCache, DeviceInfo
-                from bloombee.server.cache_coordinator import create_device_info_from_policy
-
-                if past_key_value is not None:
-                    device_info = create_device_info_from_policy(
-                        self.policy if hasattr(self, 'policy') else None,
-                        str(hidden_states.device)
-                    )
-
-                    unified_cache = UnifiedCache(
-                        past_key_value=past_key_value,
-                        device_info=device_info
-                    )
-
-                    self.cache_manager.store_cache(unified_cache, current_position, layer_id, 0)
-                    offload_logger.info(f":{current_position}, :{layer_id}, :{device_info.device_type} ({device_info.device_id})")
-                else:
-                    offload_logger.warning(f"⚠️ past_key_value为空，跳过store_cache")
-            except Exception as e:
-                offload_logger.warning(f"⚠️ KVCacheManager store_cache失败: {e}")
+        # print('block.py WrappedLlamaBlock forward : outputs ', hidden_states)
+        # print(f"WrappedLlamaBlock.forward, past_key_value: {past_key_value}")
+        # print('use_cache', use_cache)
 
         return outputs
 

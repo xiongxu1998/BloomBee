@@ -649,9 +649,9 @@ class TransformerConnectionHandler(ConnectionHandler):
         cache_manager = backends[0].cache_manager
         
         offload_logger.info(f" 使用offloading策略:")
-        offload_logger.info(f"   - GPU缓存比例: {cache_manager.policy.cache_gpu_percent}%")
-        offload_logger.info(f"   - CPU缓存比例: {cache_manager.policy.cache_cpu_percent}%")
-        offload_logger.info(f"   - CPU缓存计算: {cache_manager.policy.cpu_cache_compute}")
+        offload_logger.info(f"   - GPU缓存比例: {cache_manager.offloading_policy.cache_gpu_percent}%")
+        offload_logger.info(f"   - CPU缓存比例: {cache_manager.offloading_policy.cache_cpu_percent}%")
+        offload_logger.info(f"   - CPU缓存计算: {cache_manager.offloading_policy.cpu_cache_compute}")
         
         # 使用原有的缓存分配方式，但添加offloading调试信息
         descriptors = [backend.get_inference_cache_descriptors(batch_size, max_length) for backend in backends]

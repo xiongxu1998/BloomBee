@@ -30,7 +30,6 @@ from bloombee.server.block_utils import get_block_size, resolve_block_dtype
 from bloombee.server.from_pretrained import load_pretrained_block
 from bloombee.server.handler import TransformerConnectionHandler
 from bloombee.server.memory_cache_manager import KVCacheManager
-from bloombee.server.cache_coordinator import set_cache_coordinator
 from bloombee.server.reachability import ReachabilityProtocol, check_direct_reachability, validate_reachability
 from bloombee.server.throughput import get_dtype_name, get_server_throughput
 from bloombee.utils.auto_config import AutoDistributedConfig
@@ -277,7 +276,7 @@ class Server:
         self.policy = Policy(
             1, 1,            # gpu_batch_size, num_gpu_batches
             100, 0,          # w_gpu_percent, w_cpu_percent
-            0, 100,          # cache_gpu_percent, cache_cpu_percent (KV on GPU)
+            100, 0,          # cache_gpu_percent, cache_cpu_percent (KV on GPU)
             0, 100,          # act_gpu_percent, act_cpu_percent (activations on GPU)
             overlap=False, sep_layer=True, pin_weight=True,
             cpu_cache_compute=False, attn_sparsity=1.0,
