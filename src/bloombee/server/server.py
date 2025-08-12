@@ -30,6 +30,7 @@ from bloombee.server.block_utils import get_block_size, resolve_block_dtype
 from bloombee.server.from_pretrained import load_pretrained_block
 from bloombee.server.handler import TransformerConnectionHandler
 from bloombee.server.memory_cache_manager import KVCacheManager
+from bloombee.server.cache_coordinator import set_cache_coordinator
 from bloombee.server.reachability import ReachabilityProtocol, check_direct_reachability, validate_reachability
 from bloombee.server.throughput import get_dtype_name, get_server_throughput
 from bloombee.utils.auto_config import AutoDistributedConfig
@@ -47,6 +48,11 @@ from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.pytorch_backend import fix_recursive_import
 from bloombee.flexgen_utils.utils import ValueHolder, array_1d
 from pynvml import *
+
+# 创建专门的offloading调试logger
+import logging
+offload_logger = logging.getLogger('bloombee.offloading')
+offload_logger.setLevel(logging.INFO)
 
 # def see_memory_usage(message, force=True):
 # 	logger = ''
@@ -262,6 +268,7 @@ class Server:
 
         ##############################################################
         self.env = ExecutionEnv.create("~./flexgen_offload_dir") ##########
+
         # Policy: weights on GPU, KV cache on DISK (100%), activations在CPU
         # 如需切到混合，将 cache_cpu_percent 改为 >0（其余自动归于 disk）
         # Enable KV cache compression. Start with CPU-only cache for stability.
@@ -279,6 +286,7 @@ class Server:
             compress_cache=False,
             comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False),
         )
+
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
         self.path = '/tmp/data/llama_weights'
         ##############################################################
@@ -531,7 +539,9 @@ class ModuleContainer(threading.Thread):
     ) -> ModuleContainer:
         module_uids = [f"{dht_prefix}{UID_DELIMITER}{block_index}" for block_index in block_indices]
         print('module_uids ', module_uids)
+
         cache_manager = KVCacheManager(attn_cache_bytes, max_alloc_timeout, policy, env, block_config)
+
 
         server_info.state = ServerState.JOINING
         dht_announcer = ModuleAnnouncerThread(
@@ -674,7 +684,6 @@ class ModuleContainer(threading.Thread):
         ]
 
         self.runtime = RuntimeWithDeduplicatedPools(self.module_backends, device=None, **kwargs)
-        # note: We set device=None in runtime to avoid moving all modules to device 0 in runtime.run(). tensor_parallel has already moved it as needed.
 
         dht_announcer.announce(ServerState.ONLINE)
         self.dht_announcer = dht_announcer

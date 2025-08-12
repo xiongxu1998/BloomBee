@@ -1,12 +1,16 @@
 import dataclasses
+import time
 from enum import Enum
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple, TYPE_CHECKING
 
 import pydantic
+import torch
 from hivemind import PeerID
 from hivemind.moe.expert_uid import ExpertUID
 
-from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
+# 避免循环导入，使用TYPE_CHECKING
+if TYPE_CHECKING:
+    from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice
 
 ModuleUID = str
 UID_DELIMITER = "."  # delimits parts of one module uid, e.g. "bloom.transformer.h.4.self_attention"
@@ -108,6 +112,7 @@ class RemoteSpanInfo:
 
 RPCInfo = Dict[str, Any]
 
+# 定义Handle类型
 Handle = int
 
 
@@ -115,5 +120,6 @@ Handle = int
 class InferenceMetadata:
     uid: ExpertUID
     prefix_length: int
-    cache_handles: Tuple[Handle, ...]
+    cache_handles: Tuple["Handle", ...]  # 使用字符串类型注解避免循环导入
     active_adapter: Optional[str]
+

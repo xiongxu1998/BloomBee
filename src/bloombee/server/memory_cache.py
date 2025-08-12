@@ -10,6 +10,8 @@ import ctypes
 import multiprocessing as mp
 import os
 import time
+
+import logging
 from typing import AsyncContextManager, Dict, Optional, Sequence, Tuple, Union, Any, List
 
 import async_timeout
@@ -17,9 +19,10 @@ import torch
 import dataclasses
 from hivemind.utils import TensorDescriptor, enter_asynchronously, get_logger
 
+
+from bloombee.data_structures import Handle, UnifiedCache, DeviceInfo
 from transformers import PretrainedConfig
 
-from bloombee.data_structures import Handle
 from bloombee.utils.asyncio import shield_and_wait
 from bloombee.utils.misc import get_size_in_bytes
 from bloombee.flexgen_utils.policy import Policy
@@ -31,6 +34,10 @@ from bloombee.flexgen_utils.utils import torch_dtype_to_np_dtype
 import numpy as np
 
 logger = get_logger(__name__)
+
+# 创建专门的offloading调试logger
+offload_logger = logging.getLogger('bloombee.offloading')
+offload_logger.setLevel(logging.INFO)
 
 
 class MemoryCache:
@@ -56,6 +63,7 @@ class MemoryCache:
         self._lock_acquire_memory = mp.Lock()
         self._memory_freed_event = mp.Event()
         
+
         # flexgen' offloading depends on the task parameter, we need to mock a temp task variable for memory allocation without changing the data structure of flexgen.
         self.mocked_task = Task(
                 inputs=None,
@@ -112,8 +120,6 @@ class MemoryCache:
     @handle_counter.setter
     def handle_counter(self, value: int):
         self._handle_counter.value = value
-
-    
 
     async def _schedule_alloc(
         self, alloc_size: int, *descriptors: TensorDescriptor, timeout: Optional[float]
