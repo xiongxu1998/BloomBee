@@ -226,8 +226,10 @@ class Server:
         self.max_alloc_timeout = max_alloc_timeout
 
         # For attention cache in GPU or RAM
+        # Align cache token budget with inference_max_length by default to fit requested allocations
         if attn_cache_tokens is None:
-            attn_cache_tokens = 16384 if is_multiquery_attn else 4096
+            attn_cache_tokens = self.inference_max_length
+        # Per-token KV values per block (K and V), accounting for multi-query heads
         cache_values_per_block = 2 * self.block_config.hidden_size * attn_cache_tokens
         cache_values_per_block //= self.block_config.num_key_value_groups
         self._cache_bytes_per_block = cache_values_per_block * get_size_in_bytes(self.torch_dtype)
@@ -253,24 +255,30 @@ class Server:
 
         gib = 1024**3
         self.attn_cache_bytes = self._cache_bytes_per_block * num_blocks
-        logger.info(f"Attention cache for all blocks will consume up to {self.attn_cache_bytes / gib:.2f} GiB")
+        logger.info(
+            f"OFFLOAD: cache budget tokens={attn_cache_tokens}, max_batch={self.max_batch_size}, "
+            f"blocks={num_blocks}, total={self.attn_cache_bytes / gib:.2f} GiB"
+        )
 
         ##############################################################
         self.env = ExecutionEnv.create("~./flexgen_offload_dir") ##########
-        self.policy = Policy(1, 1,       #  gpu_batch_size: int, num_gpu_batches: int
-                    100, 0,              # w_gpu_percent: float, w_cpu_percent: float
-                    0, 100,             # cache_gpu_percent: float, cache_cpu_percent: float
-                    0, 100,             # act_gpu_percent: float, act_cpu_percent: float
-                    overlap=False, sep_layer=True, pin_weight=True,
-                    cpu_cache_compute=False, attn_sparsity=1.0,
-                    compress_weight=False,  # 暂时禁用权重压缩，避免 compressed_device 问题
-                    comp_weight_config=CompressionConfig(
-                        num_bits=4, group_size=64,
-                        group_dim=0, symmetric=False),
-                    compress_cache=False,  # 暂时禁用缓存压缩
-                    comp_cache_config=CompressionConfig(
-                        num_bits=4, group_size=64,
-                        group_dim=2, symmetric=False))
+        # Policy: weights on GPU, KV cache on DISK (100%), activations在CPU
+        # 如需切到混合，将 cache_cpu_percent 改为 >0（其余自动归于 disk）
+        # Enable KV cache compression. Start with CPU-only cache for stability.
+        # You can switch to Disk-only by setting cache_cpu_percent=0 and cache_gpu_percent=0, and using disk 100% in env.
+        # Default to GPU-only, no offloading, no compression
+        self.policy = Policy(
+            1, 1,            # gpu_batch_size, num_gpu_batches
+            100, 0,          # w_gpu_percent, w_cpu_percent
+            0, 100,          # cache_gpu_percent, cache_cpu_percent (KV on GPU)
+            0, 100,          # act_gpu_percent, act_cpu_percent (activations on GPU)
+            overlap=False, sep_layer=True, pin_weight=True,
+            cpu_cache_compute=False, attn_sparsity=1.0,
+            compress_weight=False,
+            comp_weight_config=CompressionConfig(num_bits=4, group_size=64, group_dim=0, symmetric=False),
+            compress_cache=False,
+            comp_cache_config=CompressionConfig(num_bits=4, group_size=64, group_dim=2, symmetric=False),
+        )
         self.weight_home = array_1d(self.num_blocks, ValueHolder)
         self.path = '/tmp/data/llama_weights'
         ##############################################################
@@ -523,7 +531,7 @@ class ModuleContainer(threading.Thread):
     ) -> ModuleContainer:
         module_uids = [f"{dht_prefix}{UID_DELIMITER}{block_index}" for block_index in block_indices]
         print('module_uids ', module_uids)
-        cache_manager = KVCacheManager(cache_size, max_alloc_timeout, self.policy)
+        cache_manager = KVCacheManager(attn_cache_bytes, max_alloc_timeout, policy, env, block_config)
 
         server_info.state = ServerState.JOINING
         dht_announcer = ModuleAnnouncerThread(

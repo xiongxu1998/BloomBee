@@ -117,14 +117,3 @@ class InferenceMetadata:
     prefix_length: int
     cache_handles: Tuple[Handle, ...]
     active_adapter: Optional[str]
-    
-    
-@dataclasses.dataclass(frozen=True)
-class KVCache:
-    kvs: Sequence[torch.Tensor]
-    device: KVCacheMetadata
-
-class KVCacheMetadata:
-    device: TorchDevice               # 存在哪个设备上
-    offloaded: bool = False             # 是否已 offload 到 CPU
-    # TODO: add more device info

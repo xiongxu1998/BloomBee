@@ -625,7 +625,12 @@ class TransformerConnectionHandler(ConnectionHandler):
         :returns: a list of {len(backends)} elements, where i-th element is a tuple of cache handles for i-th backend
         """
         descriptors = [backend.get_inference_cache_descriptors(batch_size, max_length) for backend in backends]
-        async with backends[0].memory_cache.allocate_cache(*chain(*descriptors), timeout=timeout) as handles:
+        logger.info(
+            f"OFFLOAD: requesting KV allocation for {len(backends)} blocks, "
+            f"batch={batch_size}, max_length={max_length}"
+        )
+        async with backends[0].cache_manager.allocate_cache(*chain(*descriptors), timeout=timeout) as handles:
+            logger.info("OFFLOAD: allocation completed; entering use_cache region")
             yield nested_pack(handles, descriptors)
 
     def _log_request(
@@ -661,7 +666,7 @@ class TransformerConnectionHandler(ConnectionHandler):
         result = {
             "version": bloombee.__version__,
             "dht_client_mode": self.dht.client_mode,
-            CACHE_TOKENS_AVAILABLE: backend.memory_cache.bytes_left // max(backend.cache_bytes_per_token.values()),
+            CACHE_TOKENS_AVAILABLE: backend.cache_manager.bytes_left() // max(backend.cache_bytes_per_token.values()),
         }
 
         if request.uid:

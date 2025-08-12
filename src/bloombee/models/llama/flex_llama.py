@@ -21,7 +21,7 @@ from bloombee.flexgen_utils.utils import (GB, T, ValueHolder,
     torch_mem_stats, torch_dtype_to_np_dtype, write_benchmark_log,
     read_benchmark_log)
 from bloombee.flexgen_utils.task import Task
-from bloombee.flexgen_utils.Policy import Policy
+from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.ExecutionEnv import ExecutionEnv
 from torch import nn
 from transformers import AutoTokenizer
@@ -610,7 +610,8 @@ class FLEX_LlamaAttention(LlamaAttention):
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             print(f"attention forward, mask: {mask.data}, ")
             k_cache, v_cache = cache_read_buf.pop()
-            see_memory_usage()
+            # Optional memory logging
+            # see_memory_usage("attention forward (decoding) before mha_gen_llama")
             if self.attention_compute == self.env.gpu:
                 print(f"attention_compute == gpu")
             elif self.attention_compute == self.env.cpu:
