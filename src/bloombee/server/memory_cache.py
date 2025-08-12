@@ -26,6 +26,7 @@ from bloombee.flexgen_utils.policy import Policy
 from bloombee.flexgen_utils.task import Task
 
 from bloombee.flexgen_utils.pytorch_backend import TorchDevice, TorchDisk, TorchMixedDevice, DeviceType, general_copy
+from bloombee.flexgen_utils.compression import TorchCompressedDevice, general_copy_compressed
 from bloombee.flexgen_utils.utils import torch_dtype_to_np_dtype
 import numpy as np
 
@@ -69,6 +70,14 @@ class MemoryCache:
         self.allocation_policy = policy
         self.block_config = block_config
         self.device = device
+        # Initialize decompress workspace if using compressed CPU backend
+        try:
+            if isinstance(self.device, TorchCompressedDevice) and getattr(self.device, 'base_device', None) is not None:
+                if self.device.base_device.device_type == DeviceType.CPU:
+                    self.device.init_attention_compute_workspace(self.block_config, self.mocked_task, self.allocation_policy)
+        except Exception:
+            # Workspace is an optimization; proceed without if unavailable
+            pass
         # For disk/mixed staging
         self._underlying: Dict[Handle, Any] = {}
         self._cpu_stage: Dict[Handle, Any] = {}
@@ -256,6 +265,18 @@ class MemoryCache:
                         logger.info(
                             f"OFFLOAD: Prepared FlexGen KV storage (mixed) handle={handle} base_shape={(S, B*H, D)} seg_lengths={seg_lengths}"
                         )
+                    elif isinstance(self.device, TorchCompressedDevice):
+                        # Compressed offloading backend: allocate compressed underlying tensor
+                        # Compression currently requires fp16
+                        np_dtype = np.float16
+                        comp_cfg = getattr(self.allocation_policy, 'comp_cache_config', None)
+                        underlying = self.device.allocate((S, B * H, D), np_dtype, comp_config=comp_cfg, pin_memory=False)
+                        self._underlying[handle] = underlying
+                        self._layout_meta[handle] = (is_key, B, H, S, D)
+                        self._allocated_tensors[handle] = None
+                        logger.info(
+                            f"OFFLOAD: Prepared Compressed KV storage handle={handle} base_shape={(S, B*H, D)} cfg=(bits={comp_cfg.num_bits}, group={comp_cfg.group_size}, dim={comp_cfg.group_dim})"
+                        )
                     else:
                         is_cpu = (getattr(descr.device, 'type', str(descr.device)) == 'cpu')
                         try:
@@ -288,14 +309,32 @@ class MemoryCache:
             if handle in self._underlying:
                 is_key, B, H, S, D = self._layout_meta[handle]
                 BH = B * H
-                torch_dtype = self._dtype_by_handle.get(handle, torch.float16)
-                stage_np_dtype = torch_dtype_to_np_dtype.get(torch_dtype, np.float16)
+                # Stage always in fp16 for compressed; otherwise follow original dtype
+                if isinstance(self.device, TorchCompressedDevice):
+                    stage_np_dtype = np.float16
+                else:
+                    torch_dtype = self._dtype_by_handle.get(handle, torch.float16)
+                    stage_np_dtype = torch_dtype_to_np_dtype.get(torch_dtype, np.float16)
                 cpu_stage = TorchDevice("cpu").allocate((S, BH, D), stage_np_dtype, pin_memory=True)
                 try:
-                    general_copy(cpu_stage, None, self._underlying[handle], None)
+                    if isinstance(self.device, TorchCompressedDevice):
+                        comp_cfg = getattr(self.allocation_policy, 'comp_cache_config', None)
+                        # If compressed base is CPU, decompress directly; if DISK, stage via CPU compressed device
+                        if self.device.base_device.device_type == DeviceType.CPU:
+                            decompressed = self.device.decompress(self._underlying[handle])
+                            cpu_stage.data.copy_(decompressed)
+                            logger.info(f"OFFLOAD: COMPRESS copy-in (decompress, base=CPU) handle={handle} -> CPU stage")
+                        else:
+                            cpu_comp = TorchDevice("cpu").compressed_device
+                            tmp_comp = cpu_comp.allocate((S, BH, D), np.float16, comp_config=comp_cfg, pin_memory=True)
+                            general_copy_compressed(tmp_comp, None, self._underlying[handle], None)
+                            decompressed = cpu_comp.decompress(tmp_comp)
+                            cpu_stage.data.copy_(decompressed)
+                            logger.info(f"OFFLOAD: COMPRESS copy-in (decompress via CPU) handle={handle} -> CPU stage")
+                    else:
+                        general_copy(cpu_stage, None, self._underlying[handle], None)
                 except Exception as e:
                     logger.warning(f"OFFLOAD: copy-in failed for handle={handle}: {e}. Filling zeros.")
-                    # initialize stage to zeros to keep shapes consistent
                     cpu_stage.data.zero_()
                 if is_key:
                     # View-only transform to [B, H, D, S]; keep it as a view so in-place writes update cpu_stage
@@ -326,8 +365,15 @@ class MemoryCache:
             for handle in handles:
                 if handle in self._underlying and handle in self._cpu_stage:
                     try:
-                        general_copy(self._underlying[handle], None, self._cpu_stage[handle], None)
-                        logger.info(f"OFFLOAD: Synced KV handle={handle} back to {type(self.device).__name__}")
+                        if isinstance(self.device, TorchCompressedDevice):
+                            comp_cfg = getattr(self.allocation_policy, 'comp_cache_config', None)
+                            cpu_comp = TorchDevice("cpu").compressed_device
+                            compressed = cpu_comp.compress(self._cpu_stage[handle].data, comp_cfg)
+                            general_copy_compressed(self._underlying[handle], None, compressed, None)
+                            logger.info(f"OFFLOAD: Synced COMPRESSED KV handle={handle} back to {type(self.device.base_device).__name__}")
+                        else:
+                            general_copy(self._underlying[handle], None, self._cpu_stage[handle], None)
+                            logger.info(f"OFFLOAD: Synced KV handle={handle} back to {type(self.device).__name__}")
                     except Exception as e:
                         logger.warning(f"OFFLOAD: copy-out failed for handle={handle}: {e}. Skipping sync.")
 

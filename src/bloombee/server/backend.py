@@ -101,28 +101,28 @@ class TransformerBackend(ModuleBackend): # hivemind: ModuleBackend.module: nn.Mo
         for descr in self.get_inference_cache_descriptors(batch_size=1, max_length=1):
             self.cache_bytes_per_token[descr.device] += descr.numel() * get_size_in_bytes(descr.dtype)
 
-        # Create CPU device list
-        num_cpus = 1  # Can be adjusted as needed
-        cpus = [torch.device('cpu') for _ in range(num_cpus)]
-        
-        # Set TensorParallel module to use CPU devices
-        self.module.devices = cpus
-        
-        # If module has module_shards, move them to CPU
-        if hasattr(self.module, 'module_shards'):
-            for shard in self.module.module_shards:
-                shard.to('cpu')
-        
-        # Set output device to CPU
-        if hasattr(self.module, 'output_device_index'):
-            self.module.output_device_index = 0  # Use first CPU as output device
-        
-        # Mark for delayed initialization
-        self.module.need_delayed_init = True
-        
-        # Record original devices for restoration when needed
+        # Decide device placement policy for module based on offloading policy
+        offload_policy = cache_manager.offloading_policy
+        is_offloading_mode = (
+            offload_policy.cache_gpu_percent < 100
+            or offload_policy.cache_cpu_percent > 0
+            or offload_policy.cache_disk_percent > 0
+            or offload_policy.compress_cache
+        )
+
+        if is_offloading_mode:
+            # Keep torch modules on CPU to prevent tensor_parallel from migrating shards to CUDA.
+            cpu_devices = [torch.device('cpu')]
+            self.module.devices = cpu_devices
+            if hasattr(self.module, 'module_shards'):
+                for shard in self.module.module_shards:
+                    shard.to('cpu')
+            if hasattr(self.module, 'output_device_index'):
+                self.module.output_device_index = 0
+
+        # Record original devices for restoration when needed (after potential override)
         self.original_devices = self.module.devices
-        self.original_output_device_index = self.module.output_device_index
+        self.original_output_device_index = getattr(self.module, 'output_device_index', 0)
 
     def get_inference_cache_descriptors(self, batch_size: int, max_length: int) -> Sequence[TensorDescriptor]:
         """Create tensor descriptors for attention cache tensors used during inference_step"""

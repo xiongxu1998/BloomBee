@@ -264,11 +264,14 @@ class Server:
         self.env = ExecutionEnv.create("~./flexgen_offload_dir") ##########
         # Policy: weights on GPU, KV cache on DISK (100%), activations在CPU
         # 如需切到混合，将 cache_cpu_percent 改为 >0（其余自动归于 disk）
+        # Enable KV cache compression. Start with CPU-only cache for stability.
+        # You can switch to Disk-only by setting cache_cpu_percent=0 and cache_gpu_percent=0, and using disk 100% in env.
+        # Default to GPU-only, no offloading, no compression
         self.policy = Policy(
             1, 1,            # gpu_batch_size, num_gpu_batches
             100, 0,          # w_gpu_percent, w_cpu_percent
-            0, 50,           # cache_gpu_percent, cache_cpu_percent => mixed: CPU 50%, Disk 50%
-            0, 100,          # act_gpu_percent, act_cpu_percent
+            0, 100,          # cache_gpu_percent, cache_cpu_percent (KV on GPU)
+            0, 100,          # act_gpu_percent, act_cpu_percent (activations on GPU)
             overlap=False, sep_layer=True, pin_weight=True,
             cpu_cache_compute=False, attn_sparsity=1.0,
             compress_weight=False,

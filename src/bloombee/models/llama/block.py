@@ -629,8 +629,24 @@ class OptimizedLlamaDecoderLayer(LlamaDecoderLayer):  # used in block_utils.py r
                         
                         if j == 0:
                             k_new, v_new = self.cache_write_buf[0][0].pop()
-                            k_new_tensor = k_new.data  # (s, b*h, d)
-                            v_new_tensor = v_new.data  # (s, b*h, d)
+                            # Support compressed KV: decompress to torch.Tensor when needed
+                            try:
+                                from bloombee.flexgen_utils.pytorch_backend import DeviceType
+                                def to_torch_tensor(x):
+                                    # If FlexGen compressed tensor, decompress
+                                    if hasattr(x, 'device') and (
+                                        getattr(getattr(x, 'device', None), 'device_type', None) == DeviceType.COMPRESSED
+                                        or (hasattr(x, 'data') and isinstance(getattr(x, 'data'), tuple) and len(getattr(x, 'data')) == 3)
+                                    ):
+                                        return x.device.decompress(x)
+                                    # If FlexGen TorchTensor, return underlying torch tensor
+                                    return getattr(x, 'data', x)
+                                k_new_tensor = to_torch_tensor(k_new)
+                                v_new_tensor = to_torch_tensor(v_new)
+                            except Exception:
+                                # Fallback to raw data if decompress pathway is unavailable
+                                k_new_tensor = getattr(k_new, 'data', k_new)
+                                v_new_tensor = getattr(v_new, 'data', v_new)
                             # Backend expects new_kvs shapes:
                             #   key:   (b*h, d, s)
                             #   value: (b*h, s, d)
