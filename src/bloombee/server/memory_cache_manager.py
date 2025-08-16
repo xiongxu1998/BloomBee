@@ -176,12 +176,11 @@ class KVCacheManager:
     @contextlib.contextmanager
     def use_cache(self, *handles: Handle) -> Sequence[torch.Tensor]:
         with self.cache.use_cache(*handles) as cache_tensors:
-            # Keep underlying tensors in the stack for centralized writes,
-            # but yield clones to callers to prevent accidental in-place edits
+            # Keep underlying tensors in the stack for centralized writes
             self._active_cache_tensors_stack.append(cache_tensors)
             try:
-                safe_views = tuple(t.detach().clone() for t in cache_tensors)
-                yield safe_views
+                # Yield tensors directly; MemoryCache manages appropriate backing behavior
+                yield cache_tensors
             finally:
                 self._active_cache_tensors_stack.pop()
 
